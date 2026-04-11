@@ -1,36 +1,73 @@
-# OptiLumen — Furkan-Develop: Semantic / Edge Layer
+# OptiLumen — Furkan-Develop: Global Enhancement Layer
 
 > **Branch:** `Furkan-Develop` | **Owner:** Furkan Cabbar  
-> **Layer:** Semantic Understanding — Scene Analysis & Segmentation
+> **Layer:** Global Enhancement — Exposure, Color Balance, Contrast  
+> **Furkan's repo:** [furkancabbar/Global-Enhancement](https://github.com/furkancabbar/Global-Enhancement)
 
 ---
 
 ## Layer Role
 
-The Semantic Layer is the **first stage** in the pipeline. It processes the raw input image to produce structured information that guides all downstream layers (Pixel, Global).
+The Global Enhancement Layer applies **scene-wide** color and tonal corrections after GFPGAN face restoration. It handles everything that affects the whole image uniformly:
 
 ```
-Input Image
+Pixel Layer output (GFPGAN restored faces)
     │
     ▼
-┌─────────────────────────────┐
-│     Semantic Layer (Furkan) │
-│  • Face detection           │
-│  • Scene classification     │
-│  • Segmentation mask        │
-│  • Edge map                 │
-└─────────────┬───────────────┘
-              │  mask_map, scene_flags, face_bboxes
-              ▼
-┌─────────────────────────────┐
-│    Pixel Layer (Batuhan)    │ ← GFPGAN v1.3 face restoration
-└─────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────┐
-│    Global Layer (Emir)      │ ← exposure, color, contrast
-└─────────────────────────────┘
+┌──────────────────────────────────────────┐
+│     Global Enhancement Layer (Furkan)   │
+│  • Exposure / brightness balancing       │
+│  • Gamma correction                      │
+│  • White balance (color cast removal)    │
+│  • Contrast & dynamic range              │
+│  • Tint adjustment                       │
+│  • Night scene detection & handling      │
+└──────────────────────┬───────────────────┘
+                       │
+                       ▼
+                Final Enhanced Image
 ```
+
+---
+
+## Critical Boundary with Pixel Layer
+
+| | Pixel Layer (Batuhan) | Global Layer (Furkan) |
+|--|----------------------|-----------------------|
+| **Scope** | Face region only | Whole image |
+| **Tech** | GFPGAN v1.3 (AI) | Tone/color mapping |
+| **Brightness** | ❌ Never touches | ✅ Controls |
+| **Color balance** | ❌ Never touches | ✅ Controls |
+| **Face sharpness** | ✅ Face detail | ❌ |
+| **Noise removal** | ✅ Face only | ❌ |
+
+---
+
+## Integration Point
+
+```python
+# Global layer receives GFPGAN-restored image:
+from pipeline import ImageEnhancementPipeline
+
+pixel_result = ImageEnhancementPipeline().restoreImage(image)
+restored = pixel_result.restored   # GFPGAN output → feed into Global layer
+
+# Furkan's module:
+# final = GlobalEnhancementPipeline().enhance(restored, profile=pixel_result.profile)
+```
+
+---
+
+## Key Classes (from Furkan's System)
+
+| Class | File | Description |
+|-------|------|-------------|
+| `GlobalEnhancementPipeline` | `pipeline.py` | Main orchestrator |
+| `ExposureBalancer` | `exposure.py` | Brightness & gamma |
+| `ColorCorrector` | `color_correction.py` | White balance, tint |
+| `ContrastEnhancer` | `contrast.py` | Dynamic range |
+| `ImageProfiler` | `profiler.py` | Scene analysis |
+| `MetricsCalculator` | `metrics.py` | PSNR, SSIM, heatmap |
 
 ---
 
@@ -41,37 +78,9 @@ git clone https://github.com/CaptainBlc/CMPE491-AI-Camera.git
 cd CMPE491-AI-Camera
 git checkout Furkan-Develop
 python setup.py
+python src/gui_main.py
 ```
 
 ---
 
-## Output Contract
-
-This layer must produce the following for downstream layers:
-
-```python
-@dataclass
-class SemanticResult:
-    mask_map: np.ndarray        # float32 HxW [0..1] face/ROI importance
-    face_bboxes: List[tuple]    # [(x1,y1,x2,y2)] face locations
-    scene_type: str             # "portrait" | "landscape" | "indoor" | "night"
-    has_face: bool
-    is_night_scene: bool
-    edge_map: np.ndarray        # uint8 HxW Canny edges
-```
-
----
-
-## Integration with Pixel Layer
-
-```python
-from pipeline import ImageEnhancementPipeline
-
-# Furkan's module produces semantic_result
-pipe = ImageEnhancementPipeline()
-result = pipe.restoreImage(image, mask_map=semantic_result.mask_map)
-```
-
----
-
-*For the full project, see the [`main`](https://github.com/CaptainBlc/CMPE491-AI-Camera) branch.*
+*Full project: [`main`](https://github.com/CaptainBlc/CMPE491-AI-Camera) · Furkan's standalone repo: [Global-Enhancement](https://github.com/furkancabbar/Global-Enhancement)*
