@@ -1,5 +1,5 @@
 # OptiLumen — Hybrid AI Image Enhancement System
-### CMPE 491 Senior Design Project | Çankaya University
+### CMPE 491 Senior Design Project | TED University
 
 <div align="center">
 
@@ -169,5 +169,5 @@ The model was pre-trained on FFHQ (70,000 high-quality faces) and fine-tuned for
 
 ## License
 
-This project is developed for academic purposes as part of CMPE 491 Senior Design Project at Çankaya University.  
+This project is developed for academic purposes as part of CMPE 491 Senior Design Project at TED University.  
 GFPGAN architecture reproduced under [MIT License](https://github.com/TencentARC/GFPGAN/blob/master/LICENSE).
