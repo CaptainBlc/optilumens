@@ -1,57 +1,70 @@
-# OptiLumen — Emir-Develop: Global Enhancement Layer
+# OptiLumen — Emir-Develop: Semantic / Edge Layer
 
 > **Branch:** `Emir-Develop` | **Owner:** Ahmet Emir Ceylan  
-> **Layer:** Global Enhancement — Exposure, Color, Contrast
+> **Layer:** Semantic Understanding — Scene Analysis, Segmentation, Edge Detection
 
 ---
 
 ## Layer Role
 
-The Global Layer applies **scene-wide** adjustments after face restoration. It handles everything that affects the whole image uniformly:
+The Semantic / Edge Layer is the **first processing stage**. It understands the scene before any enhancement begins, producing structured information that guides all downstream layers.
 
 ```
-Pixel Layer output (GFPGAN restored faces)
+Raw Input Image
     │
     ▼
-┌──────────────────────────────────┐
-│    Global Enhancement (Emir)     │
-│  • Exposure / brightness balance │
-│  • Gamma correction              │
-│  • White balance / color cast    │
-│  • Contrast (dynamic range)      │
-│  • Tint adjustment               │
-└──────────────────┬───────────────┘
-                   │
-                   ▼
-            Final Output Image
+┌──────────────────────────────────────────┐
+│     Semantic / Edge Layer (Emir)         │
+│  • Face detection & localization         │
+│  • Scene classification                  │
+│    (portrait / landscape / night / ...)  │
+│  • Segmentation mask (face, bg, sky...)  │
+│  • Edge map generation                   │
+│  • ROI importance mask (mask_map)        │
+└──────────────────────┬───────────────────┘
+                       │  mask_map, scene_flags, face_bboxes
+                       ▼
+┌──────────────────────────────────────────┐
+│    Pixel Layer (Batuhan) — GFPGAN v1.3  │
+└──────────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────┐
+│    Global Enhancement (Furkan)           │
+└──────────────────────────────────────────┘
 ```
 
 ---
 
-## Critical Boundary with Pixel Layer
+## Output Contract
 
-| | Pixel Layer (Batuhan) | Global Layer (Emir) |
-|--|----------------------|---------------------|
-| **Scope** | Face region only | Whole image |
-| **Operation** | AI face restoration | Tone / color mapping |
-| **Brightness** | ❌ Never touches | ✅ Controls |
-| **Color** | ❌ Never touches | ✅ Controls |
-| **Sharpening** | ✅ Face detail | ❌ |
-| **Noise** | ✅ Face only | ❌ |
+This layer must produce the following for downstream layers:
+
+```python
+@dataclass
+class SemanticResult:
+    mask_map: np.ndarray        # float32 HxW [0..1] — face/ROI importance map
+    face_bboxes: List[tuple]    # [(x1,y1,x2,y2)] detected face regions
+    scene_type: str             # "portrait" | "landscape" | "indoor" | "night"
+    has_face: bool              # face detected?
+    is_night_scene: bool        # night mode?
+    edge_map: np.ndarray        # uint8 HxW — Canny edge map
+    skin_ratio: float           # fraction of skin-tone pixels
+```
 
 ---
 
-## Integration Point
+## Integration with Pixel Layer
 
 ```python
-# Global layer receives GFPGAN-restored image:
+# Emir's module produces semantic_result:
 from pipeline import ImageEnhancementPipeline
 
-pixel_result = ImageEnhancementPipeline().restoreImage(image)
-restored = pixel_result.restored   # GFPGAN output
-
-# Emir's module processes this:
-final = emir_global_layer.enhance(restored, profile=pixel_result.profile)
+pipe = ImageEnhancementPipeline()
+result = pipe.restoreImage(
+    image,
+    mask_map=semantic_result.mask_map,   # Emir's ROI map guides GFPGAN
+)
 ```
 
 ---
@@ -67,4 +80,4 @@ python setup.py
 
 ---
 
-*For the full project, see the [`main`](https://github.com/CaptainBlc/CMPE491-AI-Camera) branch.*
+*Full project: [`main`](https://github.com/CaptainBlc/CMPE491-AI-Camera) · Furkan's global layer: [furkancabbar/Global-Enhancement](https://github.com/furkancabbar/Global-Enhancement)*

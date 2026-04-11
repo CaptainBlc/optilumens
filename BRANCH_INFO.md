@@ -1,30 +1,32 @@
 # Emir-Develop Branch
 
 **Owner:** Ahmet Emir Ceylan  
-**Layer:** Global Enhancement — Exposure, Color Balance, Contrast  
+**Layer:** Semantic / Edge Layer — Scene Understanding & Segmentation  
 **Status:** In Development
 
 ---
 
-## Layer Responsibility
+## Responsibility
 
-- Exposure balancing (histogram stretching, gamma correction)
-- White balance correction (color cast removal)
-- Contrast enhancement (adaptive tone mapping)
-- Tint adjustment
-- Night scene handling
+- Face detection and bounding box localization
+- Scene classification (portrait, landscape, indoor, night, etc.)
+- Segmentation mask generation (foreground/background/face region)
+- ROI importance map (`mask_map`) for the Pixel Layer
+- Edge map generation (Canny / Sobel)
+- Skin-tone detection
 
-## Input From Pixel Layer
+## Output to Pixel Layer
 
 ```python
-# Emir receives:
-restored_image: np.ndarray   # GFPGAN-processed BGR uint8 image
-profile: ProfileResult        # scene analysis (brightness, skin, night, etc.)
+mask_map: np.ndarray      # float32 [0..1] HxW — high=face/ROI, low=background
+face_bboxes: list         # [(x1,y1,x2,y2), ...]
+scene_flags: dict         # {"is_night": bool, "has_face": bool, ...}
+edge_map: np.ndarray      # uint8 HxW
 ```
 
-## Files
+## Planned Files
 
-- `src/global_enhancer.py` — GlobalEnhancer class
-- `src/exposure.py` — ExposureBalancer
-- `src/color_correction.py` — ColorCorrector
-- `src/contrast.py` — ContrastEnhancer
+- `src/semantic/segmenter.py`     → Segmentation module
+- `src/semantic/edge_detector.py` → Edge detection
+- `src/semantic/scene_classifier.py` → Scene type classification
+- `src/semantic/face_detector.py` → Lightweight face detection
