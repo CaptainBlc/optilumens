@@ -1,0 +1,43 @@
+# ── Model weights (large files, download separately) ───────────
+checkpoints/*.pth
+checkpoints/*.pt
+checkpoints/*.onnx
+
+# ── Python cache ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ─────────────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+
+# ── Output images (generated, not source) ──────────────────────
+outputs/*.jpg
+outputs/*.jpeg
+outputs/*.png
+outputs/*.bmp
+outputs/*.tiff
+
+# ── Training / test data images (large, download separately) ───
+data/train/images/
+data/test/
+test_mix/
+
+# ── facexlib / gfpgan auto-downloaded detection models ─────────
+gfpgan/weights/
+facexlib/weights/
+
+# ── IDE / OS ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ── Logs ────────────────────────────────────────────────────────
+*.log
+outputs/pixel_pipeline_log.txt
