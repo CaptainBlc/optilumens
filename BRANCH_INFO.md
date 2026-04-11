@@ -1,48 +1,47 @@
-# Batuhan-Develop Branch
+# Furkan-Develop Branch
 
-**Owner:** Batuhan Taşdemir  
-**Layer:** Pixel Layer — GFPGAN v1.3 Face Restoration  
-**Status:** Active Development
+**Owner:** Furkan Cabbar  
+**Layer:** Semantic / Edge Layer — Scene Understanding & Segmentation  
+**Status:** In Development
 
 ---
 
-## This Branch Contains
+## Layer Responsibility
 
-The complete **Pixel Layer** implementation using GFPGAN v1.3:
+The Semantic Layer is responsible for understanding **what** is in the image and **where**:
 
-- `src/models/gfpgan_arch.py` — GFPGANv1Clean (StyleGAN2-based)
-- `src/models/stylegan2_clean.py` — StyleGAN2 backbone, no custom CUDA ops
-- `src/face_restorer.py` — `FaceRestorer` class (main module)
-- `src/pipeline.py` — `ImageEnhancementPipeline` orchestrator
-- `src/profiler.py` — `ImageProfiler` for scene analysis
-- `src/metrics.py` — quality evaluation
-- `src/gui/main_window.py` — interactive PyQt6 GUI
+- Face detection and localization
+- Scene classification (portrait, landscape, indoor, night, etc.)
+- Segmentation mask generation (foreground / background / face region)
+- Edge map generation
+- Semantic label output for downstream layers
 
-## Pixel Layer Responsibility
-
-Per the HLD Report, this layer handles **only**:
-- Face detection (RetinaFace via facexlib)
-- AI face restoration (GFPGAN v1.3)
-- Fidelity-controlled blending (user-adjustable 0–100%)
-- Quality metrics & explainability log
-
-**NOT** responsible for: global brightness, color balance, contrast (→ Emir's Global Layer)
-
-## Interface with Other Layers
+## Expected Output to Pixel Layer
 
 ```python
+# This is what Batuhan's Pixel Layer (GFPGAN) expects:
+mask_map: np.ndarray    # float32 [0..1], HxW — face/ROI importance map
+scene_flags: dict       # e.g. {"is_night": False, "has_face": True, ...}
+face_bboxes: list       # [(x1,y1,x2,y2), ...] detected face regions
+```
+
+## Integration Point
+
+```python
+# How Furkan's module connects to Batuhan's pipeline:
 from pipeline import ImageEnhancementPipeline
 
-pipe = ImageEnhancementPipeline(fidelity_weight=0.5)
-result = pipe.restoreImage(image_bgr)
-# result.restored  → enhanced image (numpy BGR)
-# result.metrics   → PSNR, SSIM, etc.
-# result.log       → step-by-step explanation
+semantic_result = furkan_semantic_layer.analyze(image)
+pipe = ImageEnhancementPipeline()
+result = pipe.restoreImage(
+    image,
+    face_bboxes=semantic_result.face_bboxes,
+    mask_map=semantic_result.mask_map,
+)
 ```
 
-## Setup
+## Files in This Branch
 
-```bash
-python setup.py      # installs deps + downloads GFPGANv1.3.pth
-python src/gui_main.py
-```
+- `src/semantic/` — Semantic layer module (to be implemented)
+- `src/edge_detector.py` — Edge detection module
+- `src/segmenter.py` — Image segmentation
