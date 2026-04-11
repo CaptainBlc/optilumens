@@ -1,173 +1,112 @@
-# OptiLumen — Hybrid AI Image Enhancement System
-### CMPE 491 Senior Design Project | Çankaya University
+# OptiLumen — Legacy: Classical Pixel Enhancement System
 
-<div align="center">
-
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange?logo=pytorch)
-![PyQt6](https://img.shields.io/badge/PyQt6-6.5%2B-green?logo=qt)
-![License](https://img.shields.io/badge/License-Academic-lightgrey)
-
-**Team:** Furkan Cabbar · Batuhan Taşdemir · Ahmet Emir Ceylan
-
-[Website](https://optilumen.netlify.app) · [Docs](./docs/) · [Legacy System](https://github.com/CaptainBlc/CMPE491-AI-Camera/tree/legacy)
-
-</div>
+> **⚠️ This is the `legacy` branch** — the baseline system before GFPGAN integration.  
+> For the current AI-based system, see the [`main`](https://github.com/CaptainBlc/CMPE491-AI-Camera) branch.
 
 ---
 
-## What is OptiLumen?
+## What Is This?
 
-OptiLumen is a multi-layer hybrid image enhancement system designed for device-independent face restoration. It combines AI-based face restoration (GFPGAN v1.3) with classical image processing to produce high-quality, explainable enhancements on images from any source — phones, cameras, CCTV, drones.
+This branch documents the **Phase 1 development** of the OptiLumen image enhancement system.  
+It uses classical OpenCV-based image processing — no deep learning.
+
+It serves as both a **technical baseline** and a **development history reference**, showing how the project evolved before the professor recommended GFPGAN v1.3.
+
+---
+
+## Development Timeline (This Branch)
 
 ```
-Input Image
-    │
-    ├─► Semantic Layer   (scene understanding, face detection)
-    ├─► Pixel Layer      ← Batuhan's module: GFPGAN v1.3 face restoration
-    ├─► Global Layer     ← Emir's module: exposure, color, contrast
-    └─► Fusion / Output
+v0.1 — Basic Pipeline
+  main.py + profiler.py + pixel_enhance.py
+  └── brightness boost, blur sharpening
+
+v0.2 — Edge Enhancement
+  + edge_enhance.py (Canny-based)
+
+v0.3 — Mask-Based ROI Processing
+  + mask_map support (ROI = face/center, BG = background)
+  + pixel_pipeline.py (ImageProcessor class)
+
+v0.4 — Professional Refactor
+  + PixelBasedProcessor class (aligned with HLD Report)
+  + reduceNoise() / sharpenImage() / edgePreservingFilter()
+  + Input validation, type hints, docstrings
+
+v0.5 — AI Integration (EnhanceNet)
+  + EnhanceNet: lightweight U-Net CNN
+  + Self-supervised training dataset
+  + Decision Engine (adaptive parameter selection)
+  + Quality Metrics (PSNR, SSIM, difference heatmap)
+
+v0.6 — PyQt6 GUI + Swipe Compare
+  + Interactive GUI with fidelity slider
+  + Before/After swipe compare widget
+  + Processing log (explainability)
+
+  ↓ Professor recommends GFPGAN v1.3
+  
+→ See main / Batuhan-Develop for GFPGAN system
 ```
 
 ---
 
-## Branch Structure
-
-| Branch | Owner | Description |
-|--------|-------|-------------|
-| `main` | Team | Stable integration — what you're reading now |
-| `Batuhan-Develop` | Batuhan Taşdemir | **Pixel Layer** — GFPGAN v1.3 face restoration |
-| `Furkan-Develop` | Furkan Cabbar | **Semantic / Edge Layer** — scene analysis |
-| `Emir-Develop` | Ahmet Emir Ceylan | **Global Layer** — exposure, color, contrast |
-| `Total-Develop` | Team | Integration of all three layers |
-| `legacy` | — | Classical pixel enhancement (pre-GFPGAN baseline) |
-
----
-
-## Quick Start (Clone & Run)
-
-### 1 — Clone
+## Running the Legacy System
 
 ```bash
-git clone https://github.com/CaptainBlc/CMPE491-AI-Camera.git
-cd CMPE491-AI-Camera
-```
+# Install (no PyTorch needed for classical mode)
+pip install opencv-python numpy PyQt6
 
-### 2 — Install & Download Model (one command)
+# GUI
+cd src
+python gui_main.py
 
-```bash
-python setup.py
-```
-
-This installs all dependencies **and** downloads the GFPGANv1.3 model weights (~340 MB) automatically.
-
-### 3 — Launch GUI
-
-```bash
-python src/gui_main.py
-```
-
-### Manual steps (if setup.py fails)
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Download model weights
-python scripts/download_model.py
-
-# Launch
-python src/gui_main.py
+# Batch processing
+python mask_test_batch.py
 ```
 
 ---
 
-## System Requirements
+## Key Files
 
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| Python | 3.10+ | 3.11 |
-| RAM | 4 GB | 8 GB |
-| GPU | — (CPU works) | NVIDIA CUDA 11+ |
-| Disk | 500 MB free | 1 GB |
-| OS | Windows 10+ / Linux / macOS | — |
-
-> **Note:** On Python 3.13, `torch` may require the CPU-only build:
-> ```bash
-> pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-> ```
+| File | Version | Description |
+|------|---------|-------------|
+| `legacy/pixel_enhance.py` | v0.4+ | `PixelBasedProcessor` — adaptive sharpening, CLAHE, bilateral |
+| `legacy/pixel_pipeline.py` | v0.3+ | `ImageProcessor` — pipeline orchestrator |
+| `legacy/profiler.py` | v0.2+ | `ImageProfiler` — brightness, blur, noise, skin |
+| `legacy/metrics.py` | v0.5+ | PSNR, SSIM, Entropy, difference heatmap |
+| `legacy/models/enhance_net.py` | v0.5 | EnhanceNet — lightweight U-Net CNN |
+| `legacy/train.py` | v0.5 | Self-supervised training |
+| `legacy/gui/main_window.py` | v0.6 | PyQt6 GUI |
+| `legacy/mask_test_batch.py` | v0.5 | Batch testing with ROI masks |
 
 ---
 
-## Project Structure
+## Why We Migrated to GFPGAN
 
+| Classical (this branch) | GFPGAN v1.3 (main) |
+|------------------------|---------------------|
+| OpenCV sharpening + CLAHE | StyleGAN2 generative prior |
+| Rule-based decisions | Neural network inference |
+| No face detection | RetinaFace + landmark alignment |
+| PSNR 47–51 dB (very subtle) | Blind face restoration |
+| Can't recover severe blur | Recovers severe degradation |
+| ~5 MB code, no GPU needed | 340 MB model, GPU optional |
+
+---
+
+## Interface Contract (Pixel Layer)
+
+This interface is preserved in the GFPGAN branch too:
+
+```python
+# Input
+img: np.ndarray          # BGR uint8, any resolution
+mask_map: np.ndarray     # float32 [0..1], HxW (optional)
+profile: dict            # from ImageProfiler
+
+# Output
+result: np.ndarray       # BGR uint8, same resolution
+log: list[str]           # step-by-step explanation
+metrics: QualityMetrics  # PSNR, SSIM, etc.
 ```
-CMPE491-AI-Camera/
-├── src/
-│   ├── models/
-│   │   ├── gfpgan_arch.py      # GFPGANv1Clean architecture
-│   │   └── stylegan2_clean.py  # StyleGAN2 backbone (pure PyTorch)
-│   ├── face_restorer.py        # FaceRestorer — GFPGAN v1.3 wrapper
-│   ├── pipeline.py             # ImageEnhancementPipeline (orchestrator)
-│   ├── profiler.py             # ImageProfiler — scene analysis
-│   ├── metrics.py              # PSNR, SSIM, Entropy, Colorfulness
-│   ├── main.py                 # Batch processing CLI
-│   ├── gui_main.py             # GUI entry point
-│   └── gui/
-│       └── main_window.py      # PyQt6 interactive GUI
-├── scripts/
-│   └── download_model.py       # GFPGANv1.3.pth downloader
-├── checkpoints/                # Model weights (not in git, auto-downloaded)
-├── inputs/                     # Input images for batch mode
-├── outputs/                    # Enhanced outputs
-├── docs/                       # Design reports, specifications
-├── legacy/                     # Classical baseline system (see legacy branch)
-├── setup.py                    # One-command setup
-└── requirements.txt
-```
-
----
-
-## GUI Overview
-
-The desktop GUI (PyQt6) provides:
-
-- **Drag & drop** image loading
-- **Fidelity slider** — control how much AI vs. original (0% = full GFPGAN, 100% = no change)
-- **Interactive swipe compare** — drag divider to compare before/after
-- **Quality metrics** — PSNR, SSIM, Entropy, Colorfulness (before & after)
-- **Difference heatmap** — visual explanation of where changes were applied
-- **Processing log** — step-by-step explainability output
-
----
-
-## How GFPGAN Works (Pixel Layer)
-
-```
-Input Face (512×512)
-    │
-    ├─ U-Net Encoder     → extracts degradation features
-    ├─ StyleGAN2 Prior   → generates clean face structure
-    ├─ SFT Conditions    → spatial feature transform (detail guidance)
-    └─ Fidelity Blend    → (1-α)×GFPGAN + α×original
-         │
-    Restored Face
-```
-
-The model was pre-trained on FFHQ (70,000 high-quality faces) and fine-tuned for blind face restoration — handling blur, noise, low-light, and compression artifacts simultaneously.
-
----
-
-## Documentation
-
-- [High Level Design Report](./docs/High_Level_Design_Report.md)
-- [Project Specifications](./docs/Project_Specifications_Report.md)
-- [Analysis Report](./docs/Analysis_Report.md)
-- [Pixel Layer Interface Specification](./docs/TASARIM_OZETI.md)
-
----
-
-## License
-
-This project is developed for academic purposes as part of CMPE 491 Senior Design Project at Çankaya University.  
-GFPGAN architecture reproduced under [MIT License](https://github.com/TencentARC/GFPGAN/blob/master/LICENSE).
