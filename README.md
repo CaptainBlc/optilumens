@@ -23,9 +23,9 @@ OptiLumen is a multi-layer hybrid image enhancement system designed for device-i
 ```
 Input Image
     │
-    ├─► Semantic Layer   (scene understanding, face detection)
-    ├─► Pixel Layer      ← Batuhan's module: GFPGAN v1.3 face restoration
-    ├─► Global Layer     ← Emir's module: exposure, color, contrast
+    ├─► Semantic / Edge Layer  ← Emir's module: scene understanding, segmentation
+    ├─► Pixel Layer            ← Batuhan's module: GFPGAN v1.3 face restoration
+    ├─► Global Enhancement     ← Furkan's module: exposure, color, contrast
     └─► Fusion / Output
 ```
 
@@ -37,8 +37,8 @@ Input Image
 |--------|-------|-------------|
 | `main` | Team | Stable integration — what you're reading now |
 | `Batuhan-Develop` | Batuhan Taşdemir | **Pixel Layer** — GFPGAN v1.3 face restoration |
-| `Furkan-Develop` | Furkan Cabbar | **Semantic / Edge Layer** — scene analysis |
-| `Emir-Develop` | Ahmet Emir Ceylan | **Global Layer** — exposure, color, contrast |
+| `Furkan-Develop` | Furkan Cabbar | **Global Enhancement Layer** — exposure, color, contrast · [Furkan's repo](https://github.com/furkancabbar/Global-Enhancement) |
+| `Emir-Develop` | Ahmet Emir Ceylan | **Semantic / Edge Layer** — scene analysis, segmentation |
 | `Total-Develop` | Team | Integration of all three layers |
 | `legacy` | — | Classical pixel enhancement (pre-GFPGAN baseline) |
 
