@@ -1,0 +1,69 @@
+---
+description: OptiLumen project context — read on every session before coding
+alwaysApply: true
+---
+
+# OptiLumen — CMPE 491 Senior Design Project
+
+**University:** TED University
+**Team:** Furkan Cabbar · Batuhan Taşdemir · Ahmet Emir Ceylan
+**Repo owner (this PC):** Batuhan Taşdemir → `Batuhan-Develop` branch
+**GitHub remote:** `https://github.com/CaptainBlc/Global-Enhancement`
+
+## Always do first when asked to code
+
+1. **Read `PROGRESS.md`** at repo root — it is the source of truth for what's done, what's in flight, and what's next. AI assistants on *any* machine should treat this file as their shared memory.
+2. **Reply in Turkish** — the user communicates in Turkish. Code + comments + docstrings stay in English.
+3. **Check which branch we're on** (`git status`) before committing. Work primarily on `main`, then cascade to `Batuhan-Develop` and `Total-Develop` via fast-forward / merge.
+4. **Never edit** the `legacy/` folder — it is frozen historical code.
+
+## Architecture (must respect)
+
+```
+Input → Semantic/Edge (Emir) → Pixel (Batuhan, this repo)
+                                    ↓
+                               Global (Furkan) → Fusion → Output
+```
+
+- **Pixel Layer is this team member's responsibility.** It runs GFPGAN v1.3 (`src/face_restorer.py`) for face restoration and profile-guided classical enhancement.
+- **Pixel Layer does not do** global tone/brightness/white-balance — that's Furkan's Global Enhancement Layer.
+- **Semantic/Edge** is Emir's module and will provide `mask_map` inputs in the future.
+
+## Key files / contracts
+
+| File | Purpose |
+|------|---------|
+| `src/face_restorer.py` | GFPGAN wrapper, lazy torch imports, classical fallback |
+| `src/pipeline.py` | `ImageEnhancementPipeline` — orchestrator |
+| `src/profiler.py` | `ImageProfiler` → `ProfileResult` dataclass |
+| `src/metrics.py` | PSNR, SSIM, Entropy, Colorfulness, heatmap |
+| `src/camera_capture.py` | Live webcam I/O (Scenario 4) |
+| `src/gui/main_window.py` | PyQt6 GUI |
+| `src/models/gfpgan_arch.py` + `stylegan2_clean.py` | Pure-PyTorch GFPGAN arch (no `basicsr`) |
+
+## Environment
+
+- Python **3.13** on Windows. Must use `py -3` (not `python`).
+- `basicsr` is incompatible — we implement the GFPGAN architecture directly.
+- Torch + facexlib imports are **lazy** to survive DLL failures; respect that pattern.
+- PowerShell — **do not chain with `&&`**. Use `;` or separate calls.
+
+## Commit workflow (multi-PC handoff)
+
+1. After a non-trivial change: update `PROGRESS.md` with what changed, what's next.
+2. Commit with a conventional message (`feat(scope): ...`, `fix(...)`, `docs(...)`).
+3. Push `main`, then sync `Batuhan-Develop` and `Total-Develop`:
+   ```
+   git push origin main
+   git checkout Batuhan-Develop; git merge main --no-edit; git push
+   git checkout Total-Develop;   git merge main --no-edit; git push
+   git checkout main
+   ```
+4. Pull on the other PC with `git pull --ff-only`. AI assistant re-reads `PROGRESS.md` and resumes.
+
+## Non-negotiable rules
+
+- Never push with `--force` to `main` without explicit user approval.
+- Never commit `checkpoints/`, `venv/`, `outputs/`, `data/train/images/`, `test_mix/`.
+- Never re-introduce `basicsr` as a dependency.
+- Do not auto-install large models; `scripts/download_model.py` is the only entry point.

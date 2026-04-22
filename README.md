@@ -112,6 +112,7 @@ CMPE491-AI-Camera/
 │   ├── profiler.py             # ImageProfiler — scene analysis
 │   ├── metrics.py              # PSNR, SSIM, Entropy, Colorfulness
 │   ├── camera_capture.py       # Live webcam I/O (Scenario 4)
+│   ├── batch_processor.py      # Background batch worker (Scenarios 1 & 2)
 │   ├── main.py                 # Batch processing CLI
 │   ├── gui_main.py             # GUI entry point
 │   └── gui/
@@ -135,6 +136,7 @@ The desktop GUI (PyQt6) provides:
 
 - **Drag & drop** image loading
 - **Live camera mode** — real-time preview & one-click capture (Scenario 4)
+- **Batch folder processing** — non-blocking queue with per-file status + cancel (Scenarios 1 & 2)
 - **Fidelity slider** — control how much AI vs. original (0% = full GFPGAN, 100% = no change)
 - **Interactive swipe compare** — drag divider to compare before/after
 - **Quality metrics** — PSNR, SSIM, Entropy, Colorfulness (before & after)
@@ -173,6 +175,24 @@ The model was pre-trained on FFHQ (70,000 high-quality faces) and fine-tuned for
 
 ---
 
+## Continuing Development on Another PC
+
+This project is designed so you can clone it on any machine and have an AI assistant (Cursor / Claude Code) instantly pick up where the last session left off.
+
+- **[`PROGRESS.md`](./PROGRESS.md)** — running development log. Humans and AI both read this to see current sprint, decisions, and next actions.
+- **[`.cursor/rules/optilumen.mdc`](./.cursor/rules/optilumen.mdc)** — Cursor rule file that is auto-loaded by the AI on every session. Contains team rules, architecture contracts, commit workflow.
+
+After any non-trivial change, update the **Changelog** section of `PROGRESS.md` and push. That is the handoff.
+
+```bash
+git clone https://github.com/CaptainBlc/Global-Enhancement.git
+cd Global-Enhancement
+py -3 -m venv venv && venv\Scripts\activate
+python setup.py           # installs deps + downloads model
+```
+
+---
+
 ## Roadmap
 
 Derived from the [Analysis Report §3.5.1](./docs/Analysis_Report.md) use-case scenarios:
@@ -180,7 +200,7 @@ Derived from the [Analysis Report §3.5.1](./docs/Analysis_Report.md) use-case s
 | Sprint | Feature | Status | Scenario |
 |--------|---------|--------|----------|
 | 1 | Real-time camera capture | **Done** | §3.5.1 #4 |
-| 2 | Background rendering (batch queue, non-blocking GUI) | Planned | §3.5.1 #1,#2 |
+| 2 | Background rendering (batch queue, non-blocking GUI) | **Done** | §3.5.1 #1,#2 |
 | 3 | AI chat prompt for photo editing ("make it warmer", "soften skin") | Planned | §3.5.1 #3 |
 | 4 | Live video filter stream (Snapchat/Instagram-style) | Planned | §3.5.1 #4 ext. |
 
