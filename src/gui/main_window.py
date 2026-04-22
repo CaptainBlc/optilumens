@@ -14,7 +14,8 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSlider, QCheckBox, QTextEdit, QFrame,
     QFileDialog, QSplitter, QApplication, QSizePolicy,
-    QGridLayout, QButtonGroup,
+    QGridLayout, QButtonGroup, QDialog, QProgressBar,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt6.QtCore import Qt, QRect, QPoint, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pipeline import ImageEnhancementPipeline
 from profiler import ImageProfiler
 from camera_capture import CameraCapture
+from batch_processor import BatchWorker, collect_images
 
 RIGHT_W     = 265
 SLD_LBL_W   = 80
@@ -258,6 +260,139 @@ def _tile(label, accent=False):
     return f, v
 
 
+# ── BatchDialog (Sprint 2) ────────────────────────────────────────
+
+class BatchDialog(QDialog):
+    """Non-blocking batch-processing dialog with per-file status table."""
+
+    def __init__(self, files, out_dir: str, fidelity: float,
+                 only_center: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Enhancement — OptiLumen")
+        self.setMinimumSize(720, 480)
+        self.setModal(False)
+
+        self._files    = list(files)
+        self._out_dir  = out_dir
+        self._total    = len(self._files)
+        self._ok = self._fail = 0
+        self._done = False
+
+        lay = QVBoxLayout(self); lay.setContentsMargins(12, 10, 12, 10); lay.setSpacing(8)
+
+        hdr = QLabel(
+            "Processing <b>{}</b> image(s)<br/>"
+            "<span style='color:#888'>Output: {}</span>".format(
+                self._total, out_dir))
+        hdr.setStyleSheet("color:#ddd; font-size:12px;")
+        lay.addWidget(hdr)
+
+        self._bar = QProgressBar(); self._bar.setRange(0, self._total)
+        self._bar.setFormat("%v / %m  (%p%)")
+        self._bar.setStyleSheet(
+            "QProgressBar{background:#1a1a1a;border:1px solid #333;border-radius:4px;"
+            "color:#ddd;text-align:center;height:18px;}"
+            "QProgressBar::chunk{background:#2a7a2a;border-radius:3px;}")
+        lay.addWidget(self._bar)
+
+        self._cur = QLabel("Queued…"); self._cur.setStyleSheet("color:#aaa; font-size:11px;")
+        lay.addWidget(self._cur)
+
+        self._tbl = QTableWidget(self._total, 4)
+        self._tbl.setHorizontalHeaderLabels(["#", "File", "Status", "Time"])
+        self._tbl.verticalHeader().setVisible(False)
+        self._tbl.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self._tbl.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self._tbl.setStyleSheet(
+            "QTableWidget{background:#111;color:#ccc;gridline-color:#222;"
+            "border:1px solid #2a2a2a;font-size:11px;}"
+            "QHeaderView::section{background:#1a1a1a;color:#aaa;border:none;"
+            "padding:4px;border-bottom:1px solid #333;}")
+        for i, p in enumerate(self._files):
+            self._tbl.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self._tbl.setItem(i, 1, QTableWidgetItem(os.path.basename(p)))
+            self._tbl.setItem(i, 2, QTableWidgetItem("—"))
+            self._tbl.setItem(i, 3, QTableWidgetItem(""))
+        lay.addWidget(self._tbl, stretch=1)
+
+        self._log = QLabel(""); self._log.setStyleSheet(
+            "color:#8a8a8a; font-family:Consolas; font-size:10px;")
+        self._log.setWordWrap(True); self._log.setMinimumHeight(32)
+        lay.addWidget(self._log)
+
+        br = QHBoxLayout(); br.addStretch()
+        self._btnCancel = QPushButton("Cancel"); self._btnCancel.clicked.connect(self._cancel)
+        self._btnClose  = QPushButton("Close");  self._btnClose.setEnabled(False)
+        self._btnClose.clicked.connect(self.accept)
+        self._btnOpen   = QPushButton("Open Output Folder"); self._btnOpen.setEnabled(False)
+        self._btnOpen.clicked.connect(self._open_out)
+        br.addWidget(self._btnOpen); br.addWidget(self._btnCancel); br.addWidget(self._btnClose)
+        lay.addLayout(br)
+
+        self._worker = BatchWorker(self._files, out_dir, fidelity, only_center)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log_line.connect(self._on_log)
+        self._worker.finished_all.connect(self._on_finish)
+        self._worker.start()
+
+    # ── slots ──
+    def _on_progress(self, idx, total, fname, status, elapsed):
+        self._tbl.setItem(idx, 2, QTableWidgetItem(status.upper()))
+        it_status = self._tbl.item(idx, 2)
+        color = {"processing": "#ffb84d", "ok": "#7ed87e",
+                 "failed": "#e06666", "cancelled": "#888"}.get(status, "#aaa")
+        it_status.setForeground(QBrush(QColor(color)))
+
+        if status == "processing":
+            self._cur.setText("▶ [{}/{}] {}".format(idx + 1, total, fname))
+        else:
+            self._tbl.setItem(idx, 3, QTableWidgetItem("{:.1f}s".format(elapsed)))
+            self._bar.setValue(idx + 1)
+        self._tbl.scrollToItem(self._tbl.item(idx, 0))
+
+    def _on_log(self, line: str):
+        self._log.setText(line[-160:])
+
+    def _on_finish(self, ok: int, fail: int, _results):
+        self._ok, self._fail = ok, fail
+        self._done = True
+        self._btnCancel.setEnabled(False)
+        self._btnClose.setEnabled(True)
+        self._btnOpen.setEnabled(ok > 0)
+        tot = ok + fail
+        if tot == 0:
+            self._cur.setText("No files processed.")
+        else:
+            self._cur.setText(
+                "<b>Done.</b>  {} ok · {} failed  ({:.0f}%)".format(
+                    ok, fail, 100.0 * ok / max(1, tot)))
+
+    def _cancel(self):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._cur.setText("Cancelling…")
+            self._btnCancel.setEnabled(False)
+
+    def _open_out(self):
+        try:
+            if sys.platform == "win32":
+                os.startfile(self._out_dir)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system('open "{}"'.format(self._out_dir))
+            else:
+                os.system('xdg-open "{}"'.format(self._out_dir))
+        except Exception:
+            pass
+
+    def closeEvent(self, e):
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(3000)
+        super().closeEvent(e)
+
+
 # ── MainWindow ────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -328,8 +463,10 @@ class MainWindow(QMainWindow):
         self._bRest.setEnabled(False); self._bRest.clicked.connect(self._restore)
         self._bRset = QPushButton("Reset"); self._bRset.setEnabled(False)
         self._bRset.clicked.connect(self._reset)
+        self._bBatch = QPushButton("Batch…"); self._bBatch.clicked.connect(self._batch)
 
-        for b in (self._bLoad, self._bSave, self._bRest, self._bRset): tl.addWidget(b)
+        for b in (self._bLoad, self._bSave, self._bRest, self._bRset, self._bBatch):
+            tl.addWidget(b)
         tl.addSpacing(8)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine)
@@ -645,6 +782,46 @@ class MainWindow(QMainWindow):
         self._bSave.setEnabled(False); self._clr_met()
         self._histLbl.setPixmap(QPixmap()); self._logW.clear()
         self._view = self.V_ORIG; self._vbtns[0].setChecked(True); self._chg_view(0)
+
+    # ── Batch mode (Sprint 2 — Analysis §3.5.1 #1, #2) ──────────
+
+    def _batch(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select input folder — all images will be enhanced",
+            os.path.expanduser("~"))
+        if not folder:
+            return
+
+        files = collect_images(folder, recursive=False)
+        if not files:
+            self._logW.setHtml(self._html_log([
+                "[BATCH] No supported images found in:",
+                "  " + folder,
+                "  (.jpg .jpeg .png .bmp .tiff .webp)",
+            ]))
+            return
+
+        import time as _t
+        proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        out_dir = os.path.join(
+            proj_root, "outputs", "batch_" + _t.strftime("%Y%m%d_%H%M%S"))
+
+        fidelity = self._sldFW.value() / 100.0
+        only_center = self._ckCenter.isChecked()
+
+        dlg = BatchDialog(files, out_dir, fidelity, only_center, parent=self)
+        dlg.show()   # non-modal
+
+        self._logW.setHtml(self._html_log([
+            "=== Batch Enhancement Launched ===",
+            "  Input:     {}".format(folder),
+            "  Output:    {}".format(out_dir),
+            "  Files:     {}".format(len(files)),
+            "  Fidelity:  {:.2f}".format(fidelity),
+            "  Center-only: {}".format(only_center),
+            "",
+            "Analysis Report §3.5.1 Scenarios #1 and #2",
+        ]))
 
     # ── Live camera (Analysis Report Scenario 4) ─────────────────
 

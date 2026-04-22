@@ -13,7 +13,7 @@
 ## Current Status
 
 **Phase:** Post-refactor → GFPGAN-based system is live, GUI works, model auto-downloads.
-**Active Sprint:** Sprint 2 — Background batch rendering
+**Active Sprint:** Sprint 3 — AI chat prompt (planning)
 **Blocked on:** nothing
 
 ---
@@ -25,13 +25,18 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 | # | Name | Scenario | Status |
 |---|------|----------|--------|
 | 1 | Real-time camera capture | §3.5.1 #4 | **Done** (commit `eac998b`) |
-| 2 | Background batch rendering | §3.5.1 #1, #2 | **In progress** |
+| 2 | Background batch rendering | §3.5.1 #1, #2 | **Done** |
 | 3 | AI chat prompt for photo editing | §3.5.1 #3 | Planned |
 | 4 | Live video filter stream | §3.5.1 #4 ext. | Planned |
 
 ---
 
 ## Changelog
+
+### 2026-04-22 — Sprint 2: Background Batch Rendering (Scenarios #1, #2)
+- **New:** `src/batch_processor.py` — `BatchWorker(QThread)` processes a list of files through `ImageEnhancementPipeline`. Supports cancel, emits `progress / log_line / finished_all` signals. `collect_images(folder)` scans for `.jpg .jpeg .png .bmp .tiff .webp`.
+- **GUI:** `BatchDialog` (non-modal) shows a progress bar, per-file status table (index / file / status / time), live log line, and Cancel / Close / Open-Output buttons. New `Batch…` toolbar button wires a folder picker to the dialog. Outputs written to `outputs/batch_<timestamp>/`.
+- **Why:** GFPGAN inference on CPU is slow enough that the main window would freeze on multi-image folders. Spinning up a QThread keeps the UI responsive and lets users see per-file progress.
 
 ### 2026-04-22 — Sprint 1: Real-Time Camera (Scenario 4)
 - **New:** `src/camera_capture.py` — `CameraCapture` wrapper around OpenCV.
@@ -62,9 +67,10 @@ Input ─► Semantic/Edge (Emir, external)
 ```
 
 **Pixel Layer public API:**
-- `ImageEnhancementPipeline.enhance(img) → EnhancementResult`
+- `ImageEnhancementPipeline.restoreImage(img) → EnhancementResult`
 - `FaceRestorer.restore(img) → RestorationResult`
 - `CameraCapture.snapshot() → np.ndarray`  *(Sprint 1)*
+- `BatchWorker(files, out_dir).start()` + signals  *(Sprint 2)*
 
 ---
 
@@ -97,6 +103,6 @@ Input ─► Semantic/Edge (Emir, external)
 
 ## Next Actions (queue)
 
-1. **Sprint 2:** Batch folder processing — `QThread` worker, progress panel with per-file status + cancel, results summary.
-2. **Sprint 3:** Chat prompt UX mockup → pick LLM backend → integrate.
-3. **Sprint 4:** Live-video filter — downscale + skip frames; consider a lighter model for preview path.
+1. **Sprint 3:** Chat prompt UX mockup → pick LLM backend (local Phi-3 vs API) → integrate a simple intent-to-parameter parser first (no full LLM needed for MVP).
+2. **Sprint 4:** Live-video filter — downscale + skip frames; consider a lighter model for preview path.
+3. (Backlog) Batch mode: recursive folder scan, save-as JSON results report, parallel workers on multi-core CPUs.
