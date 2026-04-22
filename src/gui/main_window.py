@@ -29,6 +29,7 @@ from profiler import ImageProfiler
 from camera_capture import CameraCapture
 from batch_processor import BatchWorker, collect_images
 from chat_commands import parse as chat_parse, ChatExecutor
+from live_filters import make_filter, BaseFilter
 
 RIGHT_W     = 265
 SLD_LBL_W   = 80
@@ -419,6 +420,10 @@ class MainWindow(QMainWindow):
         self._cam_timer.timeout.connect(self._cam_tick)
         self._cam_frame: Optional[np.ndarray] = None
 
+        # Live filter (Sprint 4 — Analysis §3.5.1 #4 ext.)
+        self._filter: BaseFilter = make_filter("OFF")
+        self._filter_name: str = "OFF"
+
         self._build_menu()
         self._build_ui()
         self.setStyleSheet(STYLE)
@@ -484,6 +489,20 @@ class MainWindow(QMainWindow):
         self._bShot = QPushButton("Capture"); self._bShot.setVisible(False)
         self._bShot.clicked.connect(self._capture_shot)
         tl.addWidget(self._bShot)
+
+        # Live filter selector (Sprint 4) — visible only in live mode
+        self._filterLbl = QLabel("Filter:"); self._filterLbl.setVisible(False)
+        self._filterLbl.setStyleSheet("color:#888; font-size:10px; padding:0 3px;")
+        tl.addWidget(self._filterLbl)
+
+        self._fbtns = []
+        self._fgrp  = QButtonGroup(self); self._fgrp.setExclusive(True)
+        for i, nm in enumerate(["OFF", "BEAUTY", "AI"]):
+            b = QPushButton(nm); b.setObjectName("vb"); b.setCheckable(True)
+            b.setVisible(False); b.setMinimumWidth(56)
+            if i == 0: b.setChecked(True)
+            self._fgrp.addButton(b, i); self._fbtns.append(b); tl.addWidget(b)
+        self._fgrp.idClicked.connect(self._set_filter)
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
         sep2.setStyleSheet("color:#2a2a2a;"); tl.addWidget(sep2); tl.addSpacing(4)
@@ -920,12 +939,15 @@ class MainWindow(QMainWindow):
         for b in self._vbtns: b.setChecked(False)
 
         self._bShot.setVisible(True)
+        self._filterLbl.setVisible(True)
+        for b in self._fbtns: b.setVisible(True)
         self._bLoad.setEnabled(False); self._bRest.setEnabled(False)
         self._bRset.setEnabled(False)
 
         info = self._cam.info()
         self._infoLbl.setText("LIVE MODE\n" + info +
-            "\n\nPress Capture to grab a frame\nand run GFPGAN enhancement.")
+            "\n\nFilter: " + self._filter_name +
+            "\nPress Capture to grab a frame\nand run GFPGAN enhancement.")
 
         self._logW.setHtml(self._html_log([
             "=== Live Camera Mode ===",
@@ -942,6 +964,8 @@ class MainWindow(QMainWindow):
         self._cam_frame = None
 
         self._bShot.setVisible(False)
+        self._filterLbl.setVisible(False)
+        for b in self._fbtns: b.setVisible(False)
         self._bLoad.setEnabled(True)
         self._bRset.setEnabled(self._orig is not None)
         self._bRest.setEnabled(self._orig is not None)
@@ -953,8 +977,27 @@ class MainWindow(QMainWindow):
         frame = self._cam.read()
         if frame is None:
             return
-        self._cam_frame = frame
-        self._vpS.img(self._pm(frame))
+        # Apply the active live filter before display (Sprint 4).
+        display = frame
+        try:
+            display = self._filter.apply(frame)
+            if display is None:
+                display = frame
+        except Exception:
+            display = frame
+        self._cam_frame = frame  # keep the raw frame for snapshot
+        self._vpS.img(self._pm(display))
+
+    def _set_filter(self, idx: int):
+        names = ["OFF", "BEAUTY", "AI"]
+        if 0 <= idx < len(names):
+            self._filter_name = names[idx]
+            self._filter = make_filter(self._filter_name)
+            if self._cam.is_open:
+                self._infoLbl.setText(
+                    "LIVE MODE\n{}\n\nFilter: {}\nPress Capture to grab a frame\n"
+                    "and run GFPGAN enhancement.".format(
+                        self._cam.info(), self._filter_name))
 
     def _capture_shot(self):
         if not self._cam.is_open:
@@ -963,6 +1006,17 @@ class MainWindow(QMainWindow):
         if snap is None:
             self._logW.setHtml(self._html_log(["[ERROR] Snapshot failed"]))
             return
+
+        # If a live filter is active, the user probably wants its look
+        # preserved in the snapshot. Apply it once to the stabilised frame.
+        filter_used = self._filter_name
+        if filter_used != "OFF":
+            try:
+                f = self._filter.apply(snap)
+                if f is not None:
+                    snap = f
+            except Exception:
+                pass
 
         self._cam_timer.stop()
         self._bLive.setChecked(False)
@@ -990,6 +1044,7 @@ class MainWindow(QMainWindow):
         self._logW.setHtml(self._html_log([
             "=== Snapshot Captured ===",
             "  Resolution: {}x{} ({:.1f} MP)".format(w, h, w * h / 1e6),
+            "  Live filter: {}".format(filter_used),
             "",
             "Scenario 4: Real-Time Image Capture (Analysis §3.5.1)",
             "",
