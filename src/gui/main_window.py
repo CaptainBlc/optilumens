@@ -5,6 +5,7 @@ CMPE 491 Senior Design Project.
 
 import os
 import sys
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -15,7 +16,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QSplitter, QApplication, QSizePolicy,
     QGridLayout, QButtonGroup,
 )
-from PyQt6.QtCore import Qt, QRect, QPoint, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QPoint, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QPixmap, QImage, QAction, QKeySequence,
     QPainter, QPen, QColor, QFont, QBrush, QRegion,
@@ -24,6 +25,7 @@ from PyQt6.QtGui import (
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pipeline import ImageEnhancementPipeline
 from profiler import ImageProfiler
+from camera_capture import CameraCapture
 
 RIGHT_W     = 265
 SLD_LBL_W   = 80
@@ -259,7 +261,7 @@ def _tile(label, accent=False):
 # ── MainWindow ────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    V_ORIG = 0; V_REST = 1; V_CMP = 2; V_DIF = 3
+    V_ORIG = 0; V_REST = 1; V_CMP = 2; V_DIF = 3; V_LIVE = 4
 
     def __init__(self):
         super().__init__()
@@ -274,9 +276,24 @@ class MainWindow(QMainWindow):
         self._view = self.V_ORIG
         self._worker = None
 
+        # Live camera state (Analysis Report Scenario 4)
+        self._cam = CameraCapture()
+        self._cam_timer = QTimer(self)
+        self._cam_timer.setInterval(33)  # ~30 FPS
+        self._cam_timer.timeout.connect(self._cam_tick)
+        self._cam_frame: Optional[np.ndarray] = None
+
         self._build_menu()
         self._build_ui()
         self.setStyleSheet(STYLE)
+
+    def closeEvent(self, e):
+        try:
+            self._cam_timer.stop()
+            self._cam.close()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
     # ── menu ──────────────────────────────────────────────────────
 
@@ -317,6 +334,21 @@ class MainWindow(QMainWindow):
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet("color:#2a2a2a;"); tl.addWidget(sep); tl.addSpacing(4)
+
+        # Live-camera toggle (Analysis Report Scenario 4)
+        self._bLive = QPushButton("● Live"); self._bLive.setCheckable(True)
+        self._bLive.setStyleSheet(
+            "QPushButton:checked { background:#2a7a2a; color:#fff;"
+            " border-color:#2a7a2a; font-weight:bold; }")
+        self._bLive.clicked.connect(self._toggle_live)
+        tl.addWidget(self._bLive)
+
+        self._bShot = QPushButton("Capture"); self._bShot.setVisible(False)
+        self._bShot.clicked.connect(self._capture_shot)
+        tl.addWidget(self._bShot)
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet("color:#2a2a2a;"); tl.addWidget(sep2); tl.addSpacing(4)
 
         self._vbtns = []; self._vgrp = QButtonGroup(self); self._vgrp.setExclusive(True)
         for i, nm in enumerate(["Original", "Restored", "Compare", "Diff"]):
@@ -613,6 +645,114 @@ class MainWindow(QMainWindow):
         self._bSave.setEnabled(False); self._clr_met()
         self._histLbl.setPixmap(QPixmap()); self._logW.clear()
         self._view = self.V_ORIG; self._vbtns[0].setChecked(True); self._chg_view(0)
+
+    # ── Live camera (Analysis Report Scenario 4) ─────────────────
+
+    def _toggle_live(self, checked: bool):
+        if checked:
+            self._start_live()
+        else:
+            self._stop_live()
+
+    def _start_live(self):
+        cams = CameraCapture.list_cameras(max_devices=3)
+        if not cams:
+            self._bLive.setChecked(False)
+            self._logW.setHtml(self._html_log([
+                "[ERROR] No camera device found.",
+                "  Check that a webcam is connected and not used by another app.",
+            ]))
+            return
+
+        if not self._cam.open(cams[0].index, width=1280, height=720):
+            self._bLive.setChecked(False)
+            self._logW.setHtml(self._html_log([
+                "[ERROR] Failed to open camera at index {}".format(cams[0].index),
+            ]))
+            return
+
+        # Switch to LIVE view
+        self._view = self.V_LIVE
+        self._vpS.setVisible(True)
+        self._vpC.setVisible(False)
+        for b in self._vbtns: b.setChecked(False)
+
+        self._bShot.setVisible(True)
+        self._bLoad.setEnabled(False); self._bRest.setEnabled(False)
+        self._bRset.setEnabled(False)
+
+        info = self._cam.info()
+        self._infoLbl.setText("LIVE MODE\n" + info +
+            "\n\nPress Capture to grab a frame\nand run GFPGAN enhancement.")
+
+        self._logW.setHtml(self._html_log([
+            "=== Live Camera Mode ===",
+            "  {}".format(info),
+            "  Available devices: {}".format(len(cams)),
+            "  Preview running at ~30 FPS",
+            "  Press 'Capture' to snapshot → GFPGAN pipeline",
+        ]))
+        self._cam_timer.start()
+
+    def _stop_live(self):
+        self._cam_timer.stop()
+        self._cam.close()
+        self._cam_frame = None
+
+        self._bShot.setVisible(False)
+        self._bLoad.setEnabled(True)
+        self._bRset.setEnabled(self._orig is not None)
+        self._bRest.setEnabled(self._orig is not None)
+
+        self._view = self.V_ORIG
+        self._vbtns[0].setChecked(True); self._chg_view(self.V_ORIG)
+
+    def _cam_tick(self):
+        frame = self._cam.read()
+        if frame is None:
+            return
+        self._cam_frame = frame
+        self._vpS.img(self._pm(frame))
+
+    def _capture_shot(self):
+        if not self._cam.is_open:
+            return
+        snap = self._cam.snapshot()
+        if snap is None:
+            self._logW.setHtml(self._html_log(["[ERROR] Snapshot failed"]))
+            return
+
+        self._cam_timer.stop()
+        self._bLive.setChecked(False)
+        self._stop_live()
+
+        # Feed snapshot as if it were a loaded image
+        self._orig = snap
+        self._rest = self._dif = None
+        self._bRest.setEnabled(True); self._bRset.setEnabled(True)
+        self._bSave.setEnabled(False); self._clr_met()
+        self._histLbl.setPixmap(QPixmap()); self._upd_all()
+
+        h, w = snap.shape[:2]
+        pr = self._prof.profile(snap)
+        info = "Captured: {}x{}  {:.1f}MP".format(w, h, w * h / 1e6)
+        if pr:
+            info += "\nBrightness: {:.2f}  Contrast: {:.2f}".format(
+                pr.brightness, pr.contrast)
+            info += "\nBlur: {:.0f}  Noise: {:.1f}".format(pr.blur_score, pr.noise_level)
+            info += "\nSkin: {:.0f}%  {}".format(pr.skin_ratio * 100,
+                "• Face detected" if pr.has_skin else "")
+            info += "\nFlags: {}".format(pr.summary() or "Normal")
+        self._infoLbl.setText(info)
+
+        self._logW.setHtml(self._html_log([
+            "=== Snapshot Captured ===",
+            "  Resolution: {}x{} ({:.1f} MP)".format(w, h, w * h / 1e6),
+            "",
+            "Scenario 4: Real-Time Image Capture (Analysis §3.5.1)",
+            "",
+            "Ready — click 'Restore Face(s)' to run GFPGAN pipeline",
+        ]))
 
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.acceptProposedAction()

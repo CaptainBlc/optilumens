@@ -111,6 +111,7 @@ CMPE491-AI-Camera/
 │   ├── pipeline.py             # ImageEnhancementPipeline (orchestrator)
 │   ├── profiler.py             # ImageProfiler — scene analysis
 │   ├── metrics.py              # PSNR, SSIM, Entropy, Colorfulness
+│   ├── camera_capture.py       # Live webcam I/O (Scenario 4)
 │   ├── main.py                 # Batch processing CLI
 │   ├── gui_main.py             # GUI entry point
 │   └── gui/
@@ -133,11 +134,16 @@ CMPE491-AI-Camera/
 The desktop GUI (PyQt6) provides:
 
 - **Drag & drop** image loading
+- **Live camera mode** — real-time preview & one-click capture (Scenario 4)
 - **Fidelity slider** — control how much AI vs. original (0% = full GFPGAN, 100% = no change)
 - **Interactive swipe compare** — drag divider to compare before/after
 - **Quality metrics** — PSNR, SSIM, Entropy, Colorfulness (before & after)
 - **Difference heatmap** — visual explanation of where changes were applied
 - **Processing log** — step-by-step explainability output
+
+### Live Camera Mode (Analysis Report §3.5.1 — Scenario 4)
+
+Click **● Live** in the toolbar to stream your webcam feed into the GUI. Press **Capture** to take a stabilised snapshot, which is fed straight into the GFPGAN pipeline as if it were a loaded file. Works with any DirectShow / V4L2 compatible camera (laptop webcam, USB webcam, phone via DroidCam). No camera? The toolbar simply stays inactive — no failure mode leaks into the rest of the UI.
 
 ---
 
@@ -164,6 +170,19 @@ The model was pre-trained on FFHQ (70,000 high-quality faces) and fine-tuned for
 - [Project Specifications](./docs/Project_Specifications_Report.md)
 - [Analysis Report](./docs/Analysis_Report.md)
 - [Pixel Layer Interface Specification](./docs/TASARIM_OZETI.md)
+
+---
+
+## Roadmap
+
+Derived from the [Analysis Report §3.5.1](./docs/Analysis_Report.md) use-case scenarios:
+
+| Sprint | Feature | Status | Scenario |
+|--------|---------|--------|----------|
+| 1 | Real-time camera capture | **Done** | §3.5.1 #4 |
+| 2 | Background rendering (batch queue, non-blocking GUI) | Planned | §3.5.1 #1,#2 |
+| 3 | AI chat prompt for photo editing ("make it warmer", "soften skin") | Planned | §3.5.1 #3 |
+| 4 | Live video filter stream (Snapchat/Instagram-style) | Planned | §3.5.1 #4 ext. |
 
 ---
 
