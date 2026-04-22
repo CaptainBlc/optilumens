@@ -13,7 +13,7 @@
 ## Current Status
 
 **Phase:** Post-refactor → GFPGAN-based system is live, GUI works, model auto-downloads.
-**Active Sprint:** Sprint 4 — Live video filter (planning)
+**Active Sprint:** Backlog tidy-up (stretch goals) — all four roadmap sprints done.
 **Blocked on:** nothing
 
 ---
@@ -27,11 +27,19 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 | 1 | Real-time camera capture | §3.5.1 #4 | **Done** (commit `eac998b`) |
 | 2 | Background batch rendering | §3.5.1 #1, #2 | **Done** (commit `87f366d`) |
 | 3 | AI chat prompt for photo editing | §3.5.1 #3 | **Done** |
-| 4 | Live video filter stream | §3.5.1 #4 ext. | Planned |
+| 4 | Live video filter stream | §3.5.1 #4 ext. | **Done** |
 
 ---
 
 ## Changelog
+
+### 2026-04-22 — Sprint 4: Live Video Filter Stream (Scenario #4 ext.)
+- **New:** `src/live_filters.py` with three filters sharing a `BaseFilter.apply(frame) → frame` contract:
+  - `NoFilter` (OFF) — identity, <1 ms.
+  - `BeautyFilter` (BEAUTY) — bilateral skin-smoothing + CLAHE on L + unsharp + warm-tone LUT. ~40–130 ms on 720p; real-time for demo.
+  - `AIFilter` (AI) — best-effort GFPGAN wrapper: downscales to 512 px, processes every 10th frame, caches output. Falls back to BeautyFilter whenever torch/weights are absent.
+- **GUI:** filter button group (`OFF / BEAUTY / AI`) lives in the toolbar, visible only while Live mode is active. Preview frames run through the active filter before display, and the filter is applied to snapshots so the captured still matches what the user saw.
+- **Design note:** CPU GFPGAN is fundamentally too slow for real-time video; `AIFilter` is an honest hybrid — classical look every frame, AI pass cached every Nth. A CUDA GPU or a lighter restoration model is the proper upgrade path.
 
 ### 2026-04-22 — Sprint 3: AI Chat Prompt (Scenario #3)
 - **New:** `src/chat_commands.py` — rule-based intent parser (Turkish + English) with 12 intents (`restore`, `set_fidelity`, `adjust_fidelity`, `center_only`, `view`, `reset`, `save`, `open`, `live`, `capture`, `batch`, `help`) + an `unknown` fallback with a friendly hint. `Command` dataclass + `ChatExecutor.dispatch()` glue wire commands to `MainWindow` methods.
@@ -77,6 +85,7 @@ Input ─► Semantic/Edge (Emir, external)
 - `CameraCapture.snapshot() → np.ndarray`  *(Sprint 1)*
 - `BatchWorker(files, out_dir).start()` + signals  *(Sprint 2)*
 - `chat_commands.parse(text) → Command` + `ChatExecutor.dispatch(cmd, window)` *(Sprint 3)*
+- `live_filters.make_filter(name).apply(frame) → frame` — OFF/BEAUTY/AI  *(Sprint 4)*
 
 ---
 
@@ -109,6 +118,9 @@ Input ─► Semantic/Edge (Emir, external)
 
 ## Next Actions (queue)
 
-1. **Sprint 4:** Live-video filter — process preview frames at downscaled res + skip frames; evaluate whether GFPGAN is viable real-time or if a lighter face-restoration model is needed.
-2. (Backlog, Sprint 3+) Swap rule-based parser for an LLM adapter (local Phi-3 preferred; OpenAI API as fallback).
-3. (Backlog, Sprint 2+) Batch mode: recursive folder scan, JSON results report, parallel workers on multi-core CPUs.
+All four roadmap sprints delivered. Remaining ideas, ordered by presentation impact:
+
+1. **Integration milestone** — connect Furkan's Global Enhancement Layer and Emir's Semantic/Edge Layer once their `main` branches are ready. Pipeline wrapper exists; we only need to populate two call sites.
+2. **Performance** — GPU path (CUDA torch wheel auto-detect) for real-time AI filter. Lighter model (GPEN, CodeFormer-tiny) as an alternative.
+3. **Stretch**: swap rule-based chat parser for a local Phi-3 LLM adapter.
+4. **Quality of life**: recursive batch scan, per-run JSON report, in-GUI side-by-side compare of multiple batch results.

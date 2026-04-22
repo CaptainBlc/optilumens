@@ -114,6 +114,7 @@ CMPE491-AI-Camera/
 │   ├── camera_capture.py       # Live webcam I/O (Scenario 4)
 │   ├── batch_processor.py      # Background batch worker (Scenarios 1 & 2)
 │   ├── chat_commands.py        # Natural-language command parser (Scenario 3)
+│   ├── live_filters.py         # Real-time video filters (Scenario 4 ext.)
 │   ├── main.py                 # Batch processing CLI
 │   ├── gui_main.py             # GUI entry point
 │   └── gui/
@@ -137,6 +138,7 @@ The desktop GUI (PyQt6) provides:
 
 - **Drag & drop** image loading
 - **Live camera mode** — real-time preview & one-click capture (Scenario 4)
+- **Live video filters** — OFF / BEAUTY (classical real-time) / AI (GFPGAN, best-effort) selectable during live preview (Scenario 4 ext.)
 - **Batch folder processing** — non-blocking queue with per-file status + cancel (Scenarios 1 & 2)
 - **Chat bar** — drive the whole app with natural-language commands (TR + EN): `restore`, `more ai`, `fidelity 40`, `compare`, `diff`, `live`, `capture`, `batch`, `only center face`, `reset`, `help` (Scenario 3)
 - **Fidelity slider** — control how much AI vs. original (0% = full GFPGAN, 100% = no change)
@@ -204,7 +206,7 @@ Derived from the [Analysis Report §3.5.1](./docs/Analysis_Report.md) use-case s
 | 1 | Real-time camera capture | **Done** | §3.5.1 #4 |
 | 2 | Background rendering (batch queue, non-blocking GUI) | **Done** | §3.5.1 #1,#2 |
 | 3 | AI chat prompt for photo editing ("restore", "more ai", "compare") | **Done** | §3.5.1 #3 |
-| 4 | Live video filter stream (Snapchat/Instagram-style) | Planned | §3.5.1 #4 ext. |
+| 4 | Live video filter stream (Snapchat/Instagram-style) | **Done** | §3.5.1 #4 ext. |
 
 ---
 
