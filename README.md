@@ -173,6 +173,24 @@ The model was pre-trained on FFHQ (70,000 high-quality faces) and fine-tuned for
 
 ---
 
+## Continuing Development on Another PC
+
+This project is designed so you can clone it on any machine and have an AI assistant (Cursor / Claude Code) instantly pick up where the last session left off.
+
+- **[`PROGRESS.md`](./PROGRESS.md)** — running development log. Humans and AI both read this to see current sprint, decisions, and next actions.
+- **[`.cursor/rules/optilumen.mdc`](./.cursor/rules/optilumen.mdc)** — Cursor rule file that is auto-loaded by the AI on every session. Contains team rules, architecture contracts, commit workflow.
+
+After any non-trivial change, update the **Changelog** section of `PROGRESS.md` and push. That is the handoff.
+
+```bash
+git clone https://github.com/CaptainBlc/Global-Enhancement.git
+cd Global-Enhancement
+py -3 -m venv venv && venv\Scripts\activate
+python setup.py           # installs deps + downloads model
+```
+
+---
+
 ## Roadmap
 
 Derived from the [Analysis Report §3.5.1](./docs/Analysis_Report.md) use-case scenarios:
