@@ -12,7 +12,7 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QSlider, QCheckBox, QTextEdit, QFrame,
+    QPushButton, QSlider, QCheckBox, QTextEdit, QLineEdit, QFrame,
     QFileDialog, QSplitter, QApplication, QSizePolicy,
     QGridLayout, QButtonGroup, QDialog, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView,
@@ -28,6 +28,7 @@ from pipeline import ImageEnhancementPipeline
 from profiler import ImageProfiler
 from camera_capture import CameraCapture
 from batch_processor import BatchWorker, collect_images
+from chat_commands import parse as chat_parse, ChatExecutor
 
 RIGHT_W     = 265
 SLD_LBL_W   = 80
@@ -589,6 +590,32 @@ class MainWindow(QMainWindow):
         vsp.setStretchFactor(0, 5); vsp.setStretchFactor(1, 1)
         rl.addWidget(vsp, stretch=1)
 
+        # ── Chat bar (Sprint 3 — Analysis §3.5.1 #3) ─────────────
+        chat = QFrame(); chat.setObjectName("chat")
+        chat.setStyleSheet(
+            "QFrame#chat{background:#151515;border-top:1px solid #2a2a2a;"
+            "min-height:34px;max-height:34px;}"
+            "QLineEdit{background:#0f0f0f;color:#eee;border:1px solid #2a2a2a;"
+            "border-radius:3px;padding:4px 8px;font-size:11px;}"
+            "QLineEdit:focus{border-color:#c53030;}"
+            "QLabel#chatprompt{color:#888;font-size:11px;padding:0 6px;}"
+            "QPushButton#chatbtn{background:#c53030;color:#fff;border:none;"
+            "border-radius:3px;padding:3px 14px;font-weight:bold;}"
+            "QPushButton#chatbtn:hover{background:#dc4040;}")
+        cl = QHBoxLayout(chat); cl.setContentsMargins(8, 3, 8, 3); cl.setSpacing(6)
+        pmt = QLabel("▸ Chat"); pmt.setObjectName("chatprompt")
+        cl.addWidget(pmt)
+        self._chatIn = QLineEdit()
+        self._chatIn.setPlaceholderText(
+            "Try: 'restore', 'more ai', 'fidelity 40', 'compare', 'diff', "
+            "'live', 'capture', 'batch', 'reset', 'help'")
+        self._chatIn.returnPressed.connect(self._chat_send)
+        cl.addWidget(self._chatIn, stretch=1)
+        self._chatBtn = QPushButton("Send"); self._chatBtn.setObjectName("chatbtn")
+        self._chatBtn.clicked.connect(self._chat_send)
+        cl.addWidget(self._chatBtn)
+        rl.addWidget(chat)
+
     # ── helpers ───────────────────────────────────────────────────
 
     def _card(self, title):
@@ -822,6 +849,44 @@ class MainWindow(QMainWindow):
             "",
             "Analysis Report §3.5.1 Scenarios #1 and #2",
         ]))
+
+    # ── Chat (Sprint 3 — Analysis §3.5.1 #3) ────────────────────
+
+    def _chat_send(self):
+        text = self._chatIn.text().strip()
+        if not text:
+            return
+        self._chatIn.clear()
+
+        cmd = chat_parse(text)
+        result = ChatExecutor.dispatch(cmd, self)
+
+        # Append to the log as a small conversation thread.
+        cur = self._logW.toHtml() or ""
+        entry = (
+            "<div style='color:#8ac'>&gt; {}</div>"
+            "<div style='color:#bbb'>&nbsp;&nbsp;intent=<b>{}</b> "
+            "&nbsp;{}</div>"
+            "<div style='color:#7a7;margin-bottom:6px'>&nbsp;&nbsp;{}</div>"
+        ).format(
+            self._esc(text), cmd.intent,
+            self._esc(str(cmd.params)) if cmd.params else "",
+            self._esc(result))
+        # If log currently holds non-chat content, keep last section small.
+        if "chat-start" not in cur:
+            cur = "<div id='chat-start' style='color:#555'>"\
+                  "=== Chat Session ===</div>" + entry
+        else:
+            cur += entry
+        self._logW.setHtml(cur)
+        self._logW.verticalScrollBar().setValue(
+            self._logW.verticalScrollBar().maximum())
+
+    @staticmethod
+    def _esc(s: str) -> str:
+        return (str(s).replace("&", "&amp;")
+                      .replace("<", "&lt;")
+                      .replace(">", "&gt;"))
 
     # ── Live camera (Analysis Report Scenario 4) ─────────────────
 
