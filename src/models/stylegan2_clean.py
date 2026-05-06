@@ -202,7 +202,13 @@ class StyleGAN2GeneratorCSFT(nn.Module):
 
         # Replicate or mix styles
         if len(styles) == 1:
-            latent = styles[0].unsqueeze(1).repeat(1, self.num_latents, 1)
+            # When different_w=True the caller already provides a per-layer
+            # latent of shape (B, num_latents, num_style_feat); replicate only
+            # the single-W (B, num_style_feat) case.
+            if styles[0].ndim < 3:
+                latent = styles[0].unsqueeze(1).repeat(1, self.num_latents, 1)
+            else:
+                latent = styles[0]
         elif len(styles) == 2:
             inject_index = inject_index or random.randint(1, self.num_latents - 1)
             latent1 = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
@@ -231,31 +237,25 @@ class StyleGAN2GeneratorCSFT(nn.Module):
 
             out = conv1(out, latent[:, i], noise=noise[i])
 
-            # SFT condition modulation
-            if conditions and condition_idx < len(conditions):
-                cond = conditions[condition_idx]
+            # SFT — Spatial Feature Transform.
+            # Conditions list is [scale_0, shift_0, scale_1, shift_1, ...]
+            # produced by GFPGANv1Clean (one (scale, shift) pair per
+            # decoder pyramid level).  Apply once per StyleGAN block.
+            if conditions and condition_idx + 1 < len(conditions):
+                scale = conditions[condition_idx]
+                shift = conditions[condition_idx + 1]
                 if self.sft_half:
-                    out_s, out_l = out.chunk(2, dim=1)
-                    if cond.shape[2:] == out_s.shape[2:]:
-                        out_s = out_s * cond[:, :out_s.shape[1]] + cond[:, out_s.shape[1]:]
-                    out = torch.cat([out_s, out_l], dim=1)
-                elif cond.shape[2:] == out.shape[2:]:
-                    out = out * cond[:, :out.shape[1]] + cond[:, out.shape[1]:]
+                    split = out.shape[1] // 2
+                    out_same = out[:, :split]
+                    out_sft  = out[:, split:]
+                    if scale.shape[2:] == out_sft.shape[2:]:
+                        out_sft = out_sft * scale + shift
+                        out = torch.cat([out_same, out_sft], dim=1)
+                elif scale.shape[2:] == out.shape[2:]:
+                    out = out * scale + shift
+                condition_idx += 2
 
             out = conv2(out, latent[:, i + 1], noise=noise[i + 1])
-            condition_idx += 1
-
-            if conditions and condition_idx < len(conditions):
-                cond = conditions[condition_idx]
-                if self.sft_half:
-                    out_s, out_l = out.chunk(2, dim=1)
-                    if cond.shape[2:] == out_s.shape[2:]:
-                        out_s = out_s * cond[:, :out_s.shape[1]] + cond[:, out_s.shape[1]:]
-                    out = torch.cat([out_s, out_l], dim=1)
-                elif cond.shape[2:] == out.shape[2:]:
-                    out = out * cond[:, :out.shape[1]] + cond[:, out.shape[1]:]
-            condition_idx += 1
-
             skip = to_rgb(out, latent[:, i + 2], skip)
             i += 2
 

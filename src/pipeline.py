@@ -32,6 +32,7 @@ from face_restorer import FaceRestorer, RestorationResult
 from metrics import MetricsCalculator, QualityMetrics
 from semantic_parser import FaceParser, SemanticResult
 from region_enhancer import RegionEnhancer, RegionConfig, RegionEnhanceResult
+from global_enhancer import GlobalEnhancer, GlobalConfig, GlobalEnhanceResult
 
 
 @dataclass
@@ -45,6 +46,7 @@ class EnhancementResult:
     restoration:    Optional[RestorationResult] = None
     semantic:       Optional[SemanticResult] = None
     region_result:  Optional[RegionEnhanceResult] = None
+    global_result:  Optional[GlobalEnhanceResult] = None
     log:            List[str] = field(default_factory=list)
     success:        bool = False
 
@@ -64,6 +66,7 @@ class ImageEnhancementPipeline:
         upscale: int = 1,
         fidelity_weight: float = 0.5,
         region_config: Optional[RegionConfig] = None,
+        global_config: Optional[GlobalConfig] = None,
     ) -> None:
         self._profiler = ImageProfiler()
         self._metrics  = MetricsCalculator()
@@ -77,9 +80,12 @@ class ImageEnhancementPipeline:
             **kw,
         )
 
-        # Semantic layer (Stage 1+2): face parsing + per-region enhancement
+        # Semantic layer: face parsing + per-region enhancement
         self._parser   = FaceParser()
         self._enhancer = RegionEnhancer(region_config)
+
+        # Global layer: scene-wide tonal correction (Furkan's primary layer)
+        self._global   = GlobalEnhancer(global_config)
 
     # ── public API ────────────────────────────────────────────────
 
@@ -154,7 +160,17 @@ class ImageEnhancementPipeline:
 
         result.restored = resto.restored
 
-        # Step 4: Semantic Layer — face parsing + per-region enhancement
+        # Step 4: Global Layer — scene-wide tone correction (auto-exposure +
+        # CLAHE + saturation).  Runs before Semantic so face parsing operates
+        # on a properly-exposed image.
+        log.append("--- Global Layer ---")
+        gres = self._global.enhance(result.restored)
+        result.global_result = gres
+        log.extend("  " + ln for ln in gres.log)
+        if gres.success and gres.image is not None:
+            result.restored = gres.image
+
+        # Step 5: Semantic Layer — face parsing + per-region enhancement
         log.append("--- Semantic Layer ---")
         sem = self._parser.parse(result.restored)
         result.semantic = sem
@@ -170,10 +186,6 @@ class ImageEnhancementPipeline:
                     len(sem.faces)))
         else:
             log.append("  No faces parsed — semantic layer skipped")
-
-        # Step 5: [GlobalEnhancer placeholder]
-        log.append("--- GlobalEnhancer ---")
-        log.append("  [NOT ACTIVE] Team member's module (exposure, color, contrast)")
 
         # Step 6: Quality Metrics
         log.append("--- Quality Metrics ---")

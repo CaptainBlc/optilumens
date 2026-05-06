@@ -41,14 +41,15 @@ from region_enhancer import RegionConfig
 # Webcam frames are noisier and lower-res than studio photos.  Stronger
 # defaults so the difference is clearly visible on screen.
 LIVE_REGION_CONFIG = RegionConfig(
-    skin_smooth   = 0.65,
-    eye_sharpen   = 0.75,
-    eye_brighten  = 0.25,
-    lip_vibrance  = 0.50,
-    lip_warmth    = 0.30,
-    brow_contrast = 0.45,
-    nose_sharpen  = 0.35,
+    skin_smooth   = 0.40,    # was 0.65 — preserve face structure under bilateral
+    eye_sharpen   = 0.85,    # punchier eyes (covers glasses too via eye_g)
+    eye_brighten  = 0.28,
+    lip_vibrance  = 0.55,
+    lip_warmth    = 0.32,
+    brow_contrast = 0.55,
+    nose_sharpen  = 0.55,
     hair_denoise  = 0.00,
+    face_clarity  = 0.55,    # whole-face detail boost — features pop
     morph_open_px = 3,
     feather_px    = 9,
 )

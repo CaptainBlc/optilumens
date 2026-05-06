@@ -284,7 +284,7 @@ class FaceRestorer:
             # Restore each face
             for i, face in enumerate(self._helper.cropped_faces):
                 restored = self._run_gfpgan(face)
-                self._helper.add_restored_face(restored, face)
+                self._helper.add_restored_face(restored)
                 box = self._helper.det_faces[i] if i < len(
                     self._helper.det_faces) else []
                 result.face_bboxes.append(box)

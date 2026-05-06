@@ -20,17 +20,39 @@ from .stylegan2_clean import StyleGAN2GeneratorCSFT
 
 
 class ResBlock(nn.Module):
-    """Residual block for condition extraction."""
+    """Residual block with optional spatial up/down sampling.
 
-    def __init__(self, in_channels, out_channels):
+    Structure (matches official GFPGANv1.3 checkpoint):
+        conv1:    in -> in            (refine features)
+        rescale:  bilinear x0.5 / x2  (between conv1 and conv2)
+        conv2:    in -> out           (channel transform on rescaled features)
+        skip:     1x1 projection (in -> out) on the rescaled input
+
+    Args:
+        mode: 'down' for encoder (halves spatial), 'up' for decoder
+              (doubles spatial), or None (no rescaling).
+    """
+
+    def __init__(self, in_channels, out_channels, mode=None):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1)
+        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, 1, 1)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
         self.skip = nn.Conv2d(in_channels, out_channels, 1, bias=False)
         self.act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        if mode == 'down':
+            self.scale_factor = 0.5
+        elif mode == 'up':
+            self.scale_factor = 2.0
+        else:
+            self.scale_factor = None
 
     def forward(self, x):
         out = self.act(self.conv1(x))
+        if self.scale_factor is not None:
+            out = F.interpolate(out, scale_factor=self.scale_factor,
+                                mode='bilinear', align_corners=False)
+            x = F.interpolate(x, scale_factor=self.scale_factor,
+                              mode='bilinear', align_corners=False)
         out = self.act(self.conv2(out))
         return out + self.skip(x)
 
@@ -97,7 +119,8 @@ class GFPGANv1Clean(nn.Module):
         self.conv_body_down = nn.ModuleList()
         for i in range(self.log_size, 2, -1):
             self.conv_body_down.append(
-                ResBlock(channels[str(2 ** i)], channels[str(2 ** (i - 1))]))
+                ResBlock(channels[str(2 ** i)],
+                         channels[str(2 ** (i - 1))], mode='down'))
 
         self.final_conv = nn.Conv2d(channels['4'], channels['4'], 3, 1, 1)
 
@@ -112,14 +135,18 @@ class GFPGANv1Clean(nn.Module):
         self.conv_body_up = nn.ModuleList()
         for i in range(3, self.log_size + 1):
             self.conv_body_up.append(
-                ResBlock(channels[str(2 ** (i - 1))], channels[str(2 ** i)]))
+                ResBlock(channels[str(2 ** (i - 1))],
+                         channels[str(2 ** i)], mode='up'))
 
         # ── SFT condition layers ─────────────────────────────────
+        # Checkpoint (GFPGANv1.3.pth) was trained with sft_out == out_channels
+        # regardless of sft_half — the StyleGAN2 side splits the cond tensor
+        # into scale_half / shift_half internally when sft_half=True.
         self.condition_scale = nn.ModuleList()
         self.condition_shift = nn.ModuleList()
         for i in range(3, self.log_size + 1):
             out_channels = channels[str(2 ** i)]
-            sft_out = out_channels if not sft_half else out_channels * 2
+            sft_out = out_channels
             self.condition_scale.append(
                 nn.Sequential(
                     nn.Conv2d(out_channels, out_channels, 3, 1, 1),
@@ -140,11 +167,14 @@ class GFPGANv1Clean(nn.Module):
             narrow=narrow,
             sft_half=sft_half)
 
-        # ── Tonemapping / output conv ────────────────────────────
-        self.toRGB = nn.Sequential(
-            nn.Conv2d(3, 3, 1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(3, 3, 3, 1, 1))
+        # ── Auxiliary RGB outputs per pyramid level ──────────────
+        # One Conv2d(out_channels[i] -> 3) per U-Net decoder level.
+        # Used by GFPGAN training for multi-scale supervision; we just
+        # need them present so the checkpoint's params load cleanly.
+        self.toRGB = nn.ModuleList()
+        for i in range(3, self.log_size + 1):
+            out_channels = channels[str(2 ** i)]
+            self.toRGB.append(nn.Conv2d(out_channels, 3, 1))
 
     def forward(self, x, return_latents=False, return_rgb=True,
                 randomize_noise=True, **kwargs):
@@ -166,13 +196,12 @@ class GFPGANv1Clean(nn.Module):
                                          self.num_style_feat)
 
         # ── Decoder + SFT conditions ─────────────────────────────
+        # ResBlock(mode='up') already doubles spatial inside conv_body_up.
         for i in range(self.log_size - 2):
             enc = unet_skips[i]
             if i > 0:
                 enc = enc + dec
             dec = self.conv_body_up[i](enc)
-            dec = F.interpolate(dec, scale_factor=2, mode='bilinear',
-                                align_corners=False)
 
             scale = self.condition_scale[i](dec)
             conditions.append(scale.clone())
@@ -192,5 +221,7 @@ class GFPGANv1Clean(nn.Module):
             input_is_latent=self.input_is_latent,
             randomize_noise=randomize_noise)
 
-        image = self.toRGB(image) if return_rgb else image
+        # StyleGAN2 already produces RGB output via its internal to_rgb*.
+        # The U-Net's self.toRGB ModuleList is for training-time auxiliary
+        # supervision and is intentionally not invoked at inference.
         return image, latent
