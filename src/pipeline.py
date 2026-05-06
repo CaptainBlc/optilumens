@@ -3,18 +3,20 @@ ImageEnhancementPipeline — GFPGAN-based System.
 
 CMPE 491 Senior Design Project.
 
-Processing sequence (GFPGAN-centric):
+Processing sequence:
     1. analyzeImage()   — ImageProfiler: measure scene characteristics
     2. detectFaces()    — FaceRestorer: locate faces in image
     3. restoreFaces()   — FaceRestorer: GFPGAN v1.3 AI restoration
-    4. [GlobalEnhancer] — Team member's module (exposure, color, contrast)
-    5. computeMetrics() — QualityMetrics: PSNR, SSIM, etc.
-    6. diffMap()        — Visual explanation of changes
+    4. parse()          — FaceParser: 19-class semantic segmentation
+    5. apply()          — RegionEnhancer: per-region processing (skin/eyes/lips/...)
+    6. [GlobalEnhancer] — Team member's module (exposure, color, contrast)
+    7. computeMetrics() — QualityMetrics: PSNR, SSIM, etc.
+    8. diffMap()        — Visual explanation of changes
 
 Team responsibilities:
-    Pixel Layer (this module):  face detection + GFPGAN restoration
-    Global Layer (team member): exposure, color balance, contrast
-    Semantic Layer (team):      segmentation, labeling
+    Pixel Layer (Batuhan):    face detection + GFPGAN restoration
+    Semantic Layer (Furkan):  face parsing + per-region enhancement
+    Global Layer (placeholder): exposure, color balance, contrast
 """
 
 from __future__ import annotations
@@ -27,17 +29,21 @@ import numpy as np
 from profiler import ImageProfiler, ProfileResult
 from face_restorer import FaceRestorer, RestorationResult
 from metrics import MetricsCalculator, QualityMetrics
+from semantic_parser import FaceParser, SemanticResult
+from region_enhancer import RegionEnhancer, RegionConfig, RegionEnhanceResult
 
 
 @dataclass
 class EnhancementResult:
     """Complete output from one pipeline run."""
     original:       Optional[np.ndarray] = None
-    restored:       Optional[np.ndarray] = None
+    restored:       Optional[np.ndarray] = None     # final image (all layers)
     diff_map:       Optional[np.ndarray] = None
     profile:        Optional[ProfileResult] = None
     metrics:        Optional[QualityMetrics] = None
     restoration:    Optional[RestorationResult] = None
+    semantic:       Optional[SemanticResult] = None
+    region_result:  Optional[RegionEnhanceResult] = None
     log:            List[str] = field(default_factory=list)
     success:        bool = False
 
@@ -56,6 +62,7 @@ class ImageEnhancementPipeline:
         checkpoint_path: Optional[str] = None,
         upscale: int = 1,
         fidelity_weight: float = 0.5,
+        region_config: Optional[RegionConfig] = None,
     ) -> None:
         self._profiler = ImageProfiler()
         self._metrics  = MetricsCalculator()
@@ -68,6 +75,10 @@ class ImageEnhancementPipeline:
             fidelity_weight=fidelity_weight,
             **kw,
         )
+
+        # Semantic layer (Stage 1+2): face parsing + per-region enhancement
+        self._parser   = FaceParser()
+        self._enhancer = RegionEnhancer(region_config)
 
     # ── public API ────────────────────────────────────────────────
 
@@ -142,11 +153,28 @@ class ImageEnhancementPipeline:
 
         result.restored = resto.restored
 
-        # Step 4: [GlobalEnhancer placeholder]
+        # Step 4: Semantic Layer — face parsing + per-region enhancement
+        log.append("--- Semantic Layer ---")
+        sem = self._parser.parse(result.restored)
+        result.semantic = sem
+        log.extend("  " + ln for ln in sem.log)
+
+        if sem.success and sem.faces:
+            reg = self._enhancer.apply(result.restored, sem)
+            result.region_result = reg
+            log.extend("  " + ln for ln in reg.log)
+            if reg.success and reg.image is not None:
+                result.restored = reg.image
+                log.append("  Region-enhanced image: applied to {} face(s)".format(
+                    len(sem.faces)))
+        else:
+            log.append("  No faces parsed — semantic layer skipped")
+
+        # Step 5: [GlobalEnhancer placeholder]
         log.append("--- GlobalEnhancer ---")
         log.append("  [NOT ACTIVE] Team member's module (exposure, color, contrast)")
 
-        # Step 5: Quality Metrics
+        # Step 6: Quality Metrics
         log.append("--- Quality Metrics ---")
         try:
             m = self._metrics.compute_all(image, result.restored)
@@ -162,7 +190,7 @@ class ImageEnhancementPipeline:
         except Exception as e:
             log.append("[WARN] Metrics failed: {}".format(e))
 
-        # Step 6: Difference map
+        # Step 7: Difference map
         try:
             result.diff_map = self._metrics.difference_map(image, result.restored)
             log.append("  Difference map: generated")
