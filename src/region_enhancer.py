@@ -36,13 +36,13 @@ from semantic_parser import SemanticResult, FaceParseResult
 @dataclass
 class RegionConfig:
     """Per-region intensity (0 = no effect, 1 = max effect)."""
-    skin_smooth:   float = 0.40
-    eye_sharpen:   float = 0.50
-    eye_brighten:  float = 0.15
-    lip_vibrance:  float = 0.35
-    lip_warmth:    float = 0.20
-    brow_contrast: float = 0.30
-    nose_sharpen:  float = 0.20
+    skin_smooth:   float = 0.55
+    eye_sharpen:   float = 0.70
+    eye_brighten:  float = 0.25
+    lip_vibrance:  float = 0.55
+    lip_warmth:    float = 0.30
+    brow_contrast: float = 0.45
+    nose_sharpen:  float = 0.35
     hair_denoise:  float = 0.00      # 0 = skip (NLM is slow)
 
     # Mask processing

@@ -184,7 +184,7 @@ class SwipeWidget(QWidget):
         p.setPen(QColor("#ffaa33"))
         p.drawText(xo + 6, yo + 15, "ORIGINAL")
         p.setPen(QColor("#33ff99"))
-        p.drawText(xo + iw - 66, yo + 15, "RESTORED")
+        p.drawText(xo + iw - 72, yo + 15, "ENHANCED")
 
         pct = int(self._ratio * 100)
         p.setFont(QFont("Segoe UI", 8))
@@ -497,9 +497,9 @@ class MainWindow(QMainWindow):
 
         self._fbtns = []
         self._fgrp  = QButtonGroup(self); self._fgrp.setExclusive(True)
-        for i, nm in enumerate(["OFF", "BEAUTY", "AI"]):
+        for i, nm in enumerate(["OFF", "BEAUTY", "ENHANCE", "AI"]):
             b = QPushButton(nm); b.setObjectName("vb"); b.setCheckable(True)
-            b.setVisible(False); b.setMinimumWidth(56)
+            b.setVisible(False); b.setMinimumWidth(62)
             if i == 0: b.setChecked(True)
             self._fgrp.addButton(b, i); self._fbtns.append(b); tl.addWidget(b)
         self._fgrp.idClicked.connect(self._set_filter)
@@ -970,6 +970,8 @@ class MainWindow(QMainWindow):
         self._bRset.setEnabled(self._orig is not None)
         self._bRest.setEnabled(self._orig is not None)
 
+        self._vpC.setVisible(False)
+        self._vpS.setVisible(True)
         self._view = self.V_ORIG
         self._vbtns[0].setChecked(True); self._chg_view(self.V_ORIG)
 
@@ -986,10 +988,20 @@ class MainWindow(QMainWindow):
         except Exception:
             display = frame
         self._cam_frame = frame  # keep the raw frame for snapshot
-        self._vpS.img(self._pm(display))
+
+        if self._filter_name == "ENHANCE":
+            if not self._vpC.isVisible():
+                self._vpS.setVisible(False)
+                self._vpC.setVisible(True)
+            self._vpC.set_images(self._pm(frame), self._pm(display))
+        else:
+            if not self._vpS.isVisible():
+                self._vpS.setVisible(True)
+                self._vpC.setVisible(False)
+            self._vpS.img(self._pm(display))
 
     def _set_filter(self, idx: int):
-        names = ["OFF", "BEAUTY", "AI"]
+        names = ["OFF", "BEAUTY", "ENHANCE", "AI"]
         if 0 <= idx < len(names):
             self._filter_name = names[idx]
             self._filter = make_filter(self._filter_name)

@@ -32,6 +32,7 @@ from face_restorer import FaceRestorer, RestorationResult
 from metrics import MetricsCalculator, QualityMetrics
 from semantic_parser import FaceParser, SemanticResult
 from region_enhancer import RegionEnhancer, RegionConfig, RegionEnhanceResult
+from global_enhancer import GlobalEnhancer, GlobalEnhancerConfig
 
 
 @dataclass
@@ -80,6 +81,9 @@ class ImageEnhancementPipeline:
         # Semantic layer (Stage 1+2): face parsing + per-region enhancement
         self._parser   = FaceParser()
         self._enhancer = RegionEnhancer(region_config)
+
+        # Global enhancement layer (Stage 3)
+        self._global_enhancer = GlobalEnhancer()
 
     # ── public API ────────────────────────────────────────────────
 
@@ -171,9 +175,18 @@ class ImageEnhancementPipeline:
         else:
             log.append("  No faces parsed — semantic layer skipped")
 
-        # Step 5: [GlobalEnhancer placeholder]
+        # Step 5: Global Enhancement
         log.append("--- GlobalEnhancer ---")
-        log.append("  [NOT ACTIVE] Team member's module (exposure, color, contrast)")
+        try:
+            ge = self._global_enhancer.enhance(
+                result.restored, profile=profile, use_temporal=False)
+            if ge.success and ge.image is not None:
+                result.restored = ge.image
+                log.extend("  " + ln for ln in ge.log)
+            else:
+                log.append("  GlobalEnhancer returned no result — passthrough")
+        except Exception as _e:
+            log.append("  [WARN] GlobalEnhancer failed: {}".format(_e))
 
         # Step 6: Quality Metrics
         log.append("--- Quality Metrics ---")

@@ -71,55 +71,130 @@ class BeautyFilter(BaseFilter):
                            dtype=np.uint8)
 
     def __init__(self,
-                 smooth_strength: float = 0.6,
-                 clarity: float = 0.35,
-                 warmth: float = 0.25) -> None:
-        self.smooth = float(np.clip(smooth_strength, 0.0, 1.0))
+                 smooth_strength: float = 0.65,
+                 clarity: float = 0.60,
+                 warmth: float = 0.35) -> None:
+        self.smooth  = float(np.clip(smooth_strength, 0.0, 1.0))
         self.clarity = float(np.clip(clarity, 0.0, 1.0))
         self.warmth  = float(np.clip(warmth, 0.0, 1.0))
-        self._clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
+        self._clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or frame.size == 0:
             return frame
         out = frame
 
-        # 1) Skin-preserving smoothing. Use a small bilateral — cheap,
-        #    preserves edges. Mix with the original so we never flatten
-        #    texture fully.
+        # 1) Edge-preserving bilateral smoothing
         if self.smooth > 0:
-            d = 7 if max(frame.shape[:2]) < 900 else 9
-            sm = cv2.bilateralFilter(out, d=d, sigmaColor=35, sigmaSpace=9)
-            a = 0.35 + 0.55 * self.smooth
+            d  = 7 if max(frame.shape[:2]) < 900 else 9
+            sm = cv2.bilateralFilter(out, d=d, sigmaColor=50, sigmaSpace=12)
+            a  = 0.40 + 0.50 * self.smooth
             out = cv2.addWeighted(sm, a, out, 1.0 - a, 0.0)
 
-        # 2) CLAHE on L — local contrast without global brightness drift.
+        # 2) CLAHE on L — stronger clip for visible contrast pop
         if self.clarity > 0:
             lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
             L, A, B = cv2.split(lab)
             L_eq = self._clahe.apply(L)
-            a = 0.4 + 0.6 * self.clarity
-            L = cv2.addWeighted(L_eq, a, L, 1.0 - a, 0.0)
-            out = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
+            a    = 0.5 + 0.5 * self.clarity
+            L    = cv2.addWeighted(L_eq, a, L, 1.0 - a, 0.0)
+            out  = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
 
-        # 3) Unsharp mask — structural pop.
+        # 3) Two-scale unsharp mask
         if self.clarity > 0:
-            blur = cv2.GaussianBlur(out, (0, 0), 1.2)
-            amt  = 0.25 + 0.45 * self.clarity
-            out  = cv2.addWeighted(out, 1.0 + amt, blur, -amt, 0.0)
-            out  = np.clip(out, 0, 255).astype(np.uint8)
+            img_f  = out.astype(np.float32)
+            b_fine = cv2.GaussianBlur(img_f, (0, 0), 0.8)
+            b_mid  = cv2.GaussianBlur(img_f, (0, 0), 2.0)
+            amt    = 0.35 + 0.55 * self.clarity
+            sharp  = img_f + amt * (img_f - b_fine) + amt * 0.4 * (img_f - b_mid)
+            out    = np.clip(sharp, 0, 255).astype(np.uint8)
 
-        # 4) Warm tone via LUT. Small nudge only.
+        # 4) Vibrance — boost desaturated pixels
+        if self.clarity > 0.2:
+            hsv   = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
+            H, S, V = cv2.split(hsv)
+            S_f   = S.astype(np.float32)
+            wt    = 1.0 - S_f / 255.0
+            S_new = np.clip(S_f + self.clarity * 55.0 * wt, 0, 255).astype(np.uint8)
+            out   = cv2.cvtColor(cv2.merge([H, S_new, V]), cv2.COLOR_HSV2BGR)
+
+        # 5) Warm tone via LUT
         if self.warmth > 0:
-            B, G, R = cv2.split(out)
+            Bc, G, R = cv2.split(out)
             R2 = cv2.LUT(R, self._WARM_LUT_R)
-            B2 = cv2.LUT(B, self._WARM_LUT_B)
+            B2 = cv2.LUT(Bc, self._WARM_LUT_B)
             a  = self.warmth
-            R = cv2.addWeighted(R2, a, R, 1.0 - a, 0.0)
-            B = cv2.addWeighted(B2, a, B, 1.0 - a, 0.0)
-            out = cv2.merge((B, G, R))
+            R  = cv2.addWeighted(R2, a, R, 1.0 - a, 0.0)
+            Bc = cv2.addWeighted(B2, a, Bc, 1.0 - a, 0.0)
+            out = cv2.merge((Bc, G, R))
 
         return out
+
+
+# ── Enhance: GlobalEnhancer — full quality pipeline, real-time ───────
+
+class EnhanceLiveFilter(BaseFilter):
+    """Full real-time global enhancement filter for the live webcam feed."""
+
+    name = "ENHANCE"
+
+    def __init__(self) -> None:
+        self._enhancer  = None
+        self._profiler  = None
+        self._profile   = None
+        self._frame_cnt = 0
+        self._init_done = False
+
+    def reset(self) -> None:
+        if self._enhancer is not None:
+            self._enhancer.reset()
+        self._frame_cnt = 0
+        self._profile   = None
+
+    def _ensure_init(self) -> bool:
+        if self._init_done:
+            return self._enhancer is not None
+        self._init_done = True
+        try:
+            import os, sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from global_enhancer import GlobalEnhancer, GlobalEnhancerConfig
+            from profiler import ImageProfiler
+            cfg = GlobalEnhancerConfig(
+                white_balance   = 0.85,
+                shadow_lift     = 0.80,
+                denoise         = 0.60,
+                clahe_strength  = 0.80,
+                hdr_tone        = 0.70,
+                sharpen         = 0.75,
+                vibrance        = 0.65,
+                film_look       = 0.60,
+                temporal_frames = 3,
+            )
+            self._enhancer = GlobalEnhancer(cfg)
+            self._profiler = ImageProfiler()
+            return True
+        except Exception:
+            return False
+
+    def apply(self, frame: np.ndarray) -> np.ndarray:
+        if frame is None or frame.size == 0:
+            return frame
+        if not self._ensure_init() or self._enhancer is None:
+            return frame
+        self._frame_cnt += 1
+        if self._frame_cnt % 30 == 1 and self._profiler is not None:
+            try:
+                self._profile = self._profiler.profile(frame)
+            except Exception:
+                pass
+        try:
+            res = self._enhancer.enhance(frame, self._profile, use_temporal=True)
+            if res.success and res.image is not None:
+                return res.image
+        except Exception:
+            pass
+        return frame
 
 
 # ── AI: GFPGAN, best-effort for live streams ──────────────────────
@@ -220,9 +295,10 @@ class AIFilter(BaseFilter):
 # ── Registry ──────────────────────────────────────────────────────
 
 FILTERS = {
-    "OFF":    NoFilter,
-    "BEAUTY": BeautyFilter,
-    "AI":     AIFilter,
+    "OFF":     NoFilter,
+    "BEAUTY":  BeautyFilter,
+    "ENHANCE": EnhanceLiveFilter,
+    "AI":      AIFilter,
 }
 
 
