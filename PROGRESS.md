@@ -33,6 +33,11 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 
 ## Changelog
 
+### 2026-05-06 — Merge `Furkan-Develop` into `main` (semantic + region path)
+- **Merged from** `origin/Furkan-Develop`: `src/semantic_parser.py` (`FaceParser`), `src/region_enhancer.py` (`RegionEnhancer`), `src/live_capture.py`, and `src/pipeline.py` wiring so `restoreImage()` runs GFPGAN then optional parse + per-region enhancement when faces parse successfully.
+- **Docs:** `README.md` conflict resolved (unified layer diagram + accurate class table). `BRANCH_INFO.md` updated upstream.
+- **Note:** Global whole-image enhancer is still the logged placeholder; GUI and Pixel sprints (batch, camera, chat, live filters) unchanged.
+
 ### 2026-04-22 — Sprint 4: Live Video Filter Stream (Scenario #4 ext.)
 - **New:** `src/live_filters.py` with three filters sharing a `BaseFilter.apply(frame) → frame` contract:
   - `NoFilter` (OFF) — identity, <1 ms.

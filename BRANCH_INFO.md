@@ -1,48 +1,34 @@
-# Batuhan-Develop Branch
+# Furkan-Develop Branch
 
-**Owner:** Batuhan Taşdemir  
-**Layer:** Pixel Layer — GFPGAN v1.3 Face Restoration  
-**Status:** Active Development
+**Owner:** Furkan Cabbar  
+**Layer:** Global Enhancement — Exposure, Color, Contrast  
+**Standalone repo:** https://github.com/furkancabbar/Global-Enhancement  
+**Status:** In Development
 
 ---
 
-## This Branch Contains
+## Responsibility
 
-The complete **Pixel Layer** implementation using GFPGAN v1.3:
+- Exposure balancing (histogram stretching, gamma correction)
+- White balance correction (color cast removal)
+- Contrast enhancement (adaptive tone mapping)
+- Tint adjustment
+- Night scene special handling (conservative — preserve colored lights)
+- Skin-aware color correction (conservative around faces)
 
-- `src/models/gfpgan_arch.py` — GFPGANv1Clean (StyleGAN2-based)
-- `src/models/stylegan2_clean.py` — StyleGAN2 backbone, no custom CUDA ops
-- `src/face_restorer.py` — `FaceRestorer` class (main module)
-- `src/pipeline.py` — `ImageEnhancementPipeline` orchestrator
-- `src/profiler.py` — `ImageProfiler` for scene analysis
-- `src/metrics.py` — quality evaluation
-- `src/gui/main_window.py` — interactive PyQt6 GUI
-
-## Pixel Layer Responsibility
-
-Per the HLD Report, this layer handles **only**:
-- Face detection (RetinaFace via facexlib)
-- AI face restoration (GFPGAN v1.3)
-- Fidelity-controlled blending (user-adjustable 0–100%)
-- Quality metrics & explainability log
-
-**NOT** responsible for: global brightness, color balance, contrast (→ Emir's Global Layer)
-
-## Interface with Other Layers
+## Input From Pixel Layer (Batuhan)
 
 ```python
-from pipeline import ImageEnhancementPipeline
-
-pipe = ImageEnhancementPipeline(fidelity_weight=0.5)
-result = pipe.restoreImage(image_bgr)
-# result.restored  → enhanced image (numpy BGR)
-# result.metrics   → PSNR, SSIM, etc.
-# result.log       → step-by-step explanation
+restored_image: np.ndarray   # GFPGAN-processed BGR uint8
+profile: ProfileResult        # brightness, skin_ratio, is_night_scene, etc.
 ```
 
-## Setup
+## Key Files
 
-```bash
-python setup.py      # installs deps + downloads GFPGANv1.3.pth
-python src/gui_main.py
-```
+- `src/pipeline.py`          → `GlobalEnhancementPipeline`
+- `src/exposure.py`          → `ExposureBalancer`
+- `src/color_correction.py`  → `ColorCorrector`
+- `src/contrast.py`          → `ContrastEnhancer`
+- `src/profiler.py`          → `ImageProfiler`
+- `src/metrics.py`           → `MetricsCalculator`
+- `src/gui/main_window.py`   → PyQt6 GUI
