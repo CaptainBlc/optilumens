@@ -6,15 +6,15 @@ CMPE 491 Senior Design Project.
 Webcam-driven live mode: holds the user still for ~3 seconds, then runs
 the full enhancement pipeline (GFPGAN → semantic parse → region enhance)
 on the captured frame in a background thread.  The live preview never
-freezes; the enhanced result appears in an inset corner panel as soon
-as the worker finishes.
+freezes; the result lands in the right half of a side-by-side BEFORE/
+AFTER view as soon as the worker finishes.
 
 Controls (live window has focus):
     Q / Esc      quit
     S            save the latest enhanced result to outputs/
     SPACE        toggle full-screen view of the latest enhanced result
     R            re-trigger enhancement on the current still frame
-    ↑ / ↓        increase / decrease hold duration (motion threshold tuner)
+    Up / Down    increase / decrease hold duration
 
 This module is standalone — runs without the PyQt GUI.  Stage 5 will
 embed the same primitives into the main window.
@@ -34,6 +34,24 @@ import cv2
 import numpy as np
 
 from pipeline import EnhancementResult, ImageEnhancementPipeline
+from region_enhancer import RegionConfig
+
+
+# ── Live-tuned defaults ──────────────────────────────────────────────
+# Webcam frames are noisier and lower-res than studio photos.  Stronger
+# defaults so the difference is clearly visible on screen.
+LIVE_REGION_CONFIG = RegionConfig(
+    skin_smooth   = 0.65,
+    eye_sharpen   = 0.75,
+    eye_brighten  = 0.25,
+    lip_vibrance  = 0.50,
+    lip_warmth    = 0.30,
+    brow_contrast = 0.45,
+    nose_sharpen  = 0.35,
+    hair_denoise  = 0.00,
+    morph_open_px = 3,
+    feather_px    = 9,
+)
 
 
 # ── Stability detection ──────────────────────────────────────────────
@@ -195,6 +213,83 @@ def _draw_hud(frame: np.ndarray, motion: float, held: float, hold_target: float,
     return out
 
 
+def _draw_split(live: np.ndarray, enhanced: Optional[np.ndarray],
+                motion: float, held: float, hold_target: float,
+                state: str, busy: bool, fps: float) -> np.ndarray:
+    """Side-by-side BEFORE | AFTER layout with HUD top + progress bar bottom.
+
+    Left half : current live frame
+    Right half: latest enhanced result (or placeholder if none yet)
+    """
+    H, W = live.shape[:2]
+    canvas = np.zeros((H, W * 2, 3), dtype=np.uint8)
+
+    canvas[:, :W] = live
+    if enhanced is not None:
+        # Match height to live frame
+        eh, ew = enhanced.shape[:2]
+        scale = H / max(1, eh)
+        rw = max(1, int(ew * scale))
+        if rw == W:
+            canvas[:, W:] = cv2.resize(enhanced, (W, H),
+                                       interpolation=cv2.INTER_AREA)
+        else:
+            resized = cv2.resize(enhanced, (rw, H),
+                                 interpolation=cv2.INTER_AREA)
+            # center-crop or pad to W
+            if rw > W:
+                xo = (rw - W) // 2
+                canvas[:, W:] = resized[:, xo:xo + W]
+            else:
+                canvas[:, W:W + rw] = resized
+    else:
+        # Placeholder
+        cv2.rectangle(canvas, (W, 0), (2 * W, H), (15, 15, 15), -1)
+        msg1 = "Hold still {:.0f}s".format(hold_target)
+        msg2 = "to render enhancement here"
+        (tw1, th1), _ = cv2.getTextSize(msg1, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        (tw2, th2), _ = cv2.getTextSize(msg2, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        cv2.putText(canvas, msg1,
+                    (W + (W - tw1) // 2, H // 2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2,
+                    cv2.LINE_AA)
+        cv2.putText(canvas, msg2,
+                    (W + (W - tw2) // 2, H // 2 + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 140), 1,
+                    cv2.LINE_AA)
+
+    # Center divider
+    cv2.line(canvas, (W, 0), (W, H), (0, 255, 200), 2)
+
+    # Side labels
+    cv2.rectangle(canvas, (8, H - 36), (110, H - 12), (0, 0, 0), -1)
+    cv2.putText(canvas, "BEFORE", (16, H - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 100), 1, cv2.LINE_AA)
+    cv2.rectangle(canvas, (W + 8, H - 36), (W + 110, H - 12), (0, 0, 0), -1)
+    cv2.putText(canvas, "AFTER", (W + 16, H - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1, cv2.LINE_AA)
+
+    # Top HUD bar
+    bar_h = 32
+    cv2.rectangle(canvas, (0, 0), (2 * W, bar_h), (0, 0, 0), -1)
+    txt = "{}  motion={:.2f}  hold={:.1f}/{:.1f}s  fps={:.0f}{}".format(
+        state, motion, held, hold_target, fps, "  [WORKING]" if busy else "")
+    cv2.putText(canvas, txt, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 255, 200) if not busy else (0, 200, 255), 1, cv2.LINE_AA)
+
+    # Bottom progress bar (under both halves)
+    progress = max(0.0, min(1.0, held / max(0.05, hold_target)))
+    pad = 12
+    bw, bh = 2 * W - 2 * pad, 8
+    by = H - pad - bh - 30   # above the BEFORE/AFTER labels
+    cv2.rectangle(canvas, (pad, by), (pad + bw, by + bh), (40, 40, 40), -1)
+    fill = int(bw * progress)
+    color = (60, 220, 60) if progress >= 1.0 else (60, 180, 220)
+    cv2.rectangle(canvas, (pad, by), (pad + fill, by + bh), color, -1)
+
+    return canvas
+
+
 def _draw_inset(frame: np.ndarray, enhanced: np.ndarray) -> np.ndarray:
     """Place a small enhanced thumbnail in the bottom-right corner."""
     out = frame
@@ -232,7 +327,11 @@ class LiveSession:
                  pipeline: Optional[ImageEnhancementPipeline] = None,
                  stability: Optional[StabilityConfig] = None,
                  session: Optional[SessionConfig] = None) -> None:
-        self.pipeline = pipeline if pipeline is not None else ImageEnhancementPipeline()
+        if pipeline is None:
+            # Live mode uses a more aggressive RegionConfig — webcam input
+            # is noisier than photos so subtle defaults disappear.
+            pipeline = ImageEnhancementPipeline(region_config=LIVE_REGION_CONFIG)
+        self.pipeline = pipeline
         self.s_cfg = stability if stability is not None else StabilityConfig()
         self.cfg   = session if session is not None else SessionConfig()
         self._detector = StabilityDetector(self.s_cfg)
@@ -257,6 +356,7 @@ class LiveSession:
         last_enhanced_id: int = -1     # to detect new results
         latest_enhanced: Optional[np.ndarray] = None
         full_view: bool = False
+        was_busy: bool = False
         fps_t = time.time()
         fps = 0.0
         n_done = 0
@@ -270,10 +370,24 @@ class LiveSession:
                     continue
 
                 now = time.time()
-                triggered, motion, held = self._detector.update(frame, now)
+                busy = self._worker.busy()
+
+                # Busy-lock: while the pipeline runs, don't accumulate hold
+                # time — user must restart the hold after the result lands.
+                if busy:
+                    self._detector.reset()
+                    triggered, motion, held = False, 0.0, 0.0
+                    # Still measure motion for the HUD by feeding the detector
+                    # one frame so _prev tracks; we just ignore the output.
+                    _, motion, _ = self._detector.update(frame, now)
+                    self._detector._stable_since = None   # never accumulate
+                else:
+                    if was_busy:                          # just finished
+                        self._detector.reset()
+                    triggered, motion, held = self._detector.update(frame, now)
 
                 # State labelling
-                if self._worker.busy():
+                if busy:
                     state = "ENHANCING"
                 elif triggered:
                     state = "TRIGGERED"
@@ -282,11 +396,11 @@ class LiveSession:
                 else:
                     state = "MOVING"
 
-                if triggered:
-                    submitted = self._worker.submit(frame)
-                    if submitted:
+                if triggered and not busy:
+                    if self._worker.submit(frame):
                         state = "ENHANCING"
-                    # If a job is already in flight, drop this trigger silently
+
+                was_busy = busy
 
                 # Pull latest result (non-blocking)
                 res = self._worker.latest()
@@ -315,11 +429,8 @@ class LiveSession:
                                 (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (0, 255, 200), 1, cv2.LINE_AA)
                 else:
-                    show = _draw_hud(frame, motion, held,
-                                     self.s_cfg.hold_seconds, state,
-                                     self._worker.busy(), fps)
-                    if latest_enhanced is not None:
-                        show = _draw_inset(show, latest_enhanced)
+                    show = _draw_split(frame, latest_enhanced, motion, held,
+                                       self.s_cfg.hold_seconds, state, busy, fps)
 
                 cv2.imshow(self.cfg.window_name, show)
 
