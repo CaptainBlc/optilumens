@@ -30,6 +30,7 @@ from camera_capture import CameraCapture
 from batch_processor import BatchWorker, collect_images
 from chat_commands import parse as chat_parse, ChatExecutor
 from live_filters import make_filter, BaseFilter
+from scene_presets import PRESETS
 
 RIGHT_W     = 265
 SLD_LBL_W   = 80
@@ -416,7 +417,8 @@ class MainWindow(QMainWindow):
         self._worker = None
         # Active scene preset (set by chat: "fix this old photo",
         # "make it look professional", etc.). None means use slider only.
-        self._active_preset = None
+        # Default: a safe "phone-like" natural enhancement.
+        self._active_preset = PRESETS.get("natural_plus")
         self._lastResult = None
 
         # Live camera state (Analysis Report Scenario 4)

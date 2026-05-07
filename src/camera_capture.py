@@ -92,8 +92,12 @@ class CameraCapture:
     def _backends_to_try() -> List[int]:
         import sys as _sys
         if _sys.platform == "win32":
-            # MSMF first (modern), DSHOW second (legacy), ANY last.
-            return [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+            # IMPORTANT (Windows stability):
+            # MSMF / CAP_ANY can trigger native backend crashes on some setups
+            # (e.g. obsensor/UVC depth-camera paths, driver bugs). Python
+            # try/except cannot catch those. DSHOW is the most predictable
+            # option for a demo app.
+            return [cv2.CAP_DSHOW]
         return [cv2.CAP_ANY]
 
     @staticmethod

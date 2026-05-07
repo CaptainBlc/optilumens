@@ -145,6 +145,23 @@ PRESETS: Dict[str, ScenePreset] = {
         ],
     ),
 
+    # 5b) Natural+ — default "phone-like" enhancement (safe but visible)
+    "natural_plus": ScenePreset(
+        name="natural_plus",
+        description="Default look — natural but visibly cleaner/sharper, phone-like.",
+        fidelity=0.65,
+        skin_amount=0.40, nose_amount=0.25, brows_amount=0.30,
+        eyes_sharpen=0.50, eyes_bright=0.20,
+        lips_vibrance=0.40, lips_warmth=0.20,
+        # allow global stack, but keep it mild via config mapping defaults
+        # (do not force; DecisionEngine may still skip if the image looks fine)
+        triggers=[
+            "natural+", "natural plus", "default look", "phone look", "samsung",
+            "natural artı", "dogal arti", "doğal artı",
+            "varsayilan", "varsayılan",
+        ],
+    ),
+
     # 6) Low-light — shadow lift + denoise
     "low_light": ScenePreset(
         name="low_light",
