@@ -1,23 +1,29 @@
 """
-ImageEnhancementPipeline — GFPGAN-based System.
+ImageEnhancementPipeline — orchestrated multi-model enhancement.
 
 CMPE 491 Senior Design Project.
 
-Processing sequence:
-    1. analyzeImage()   — ImageProfiler: measure scene characteristics
-    2. detectFaces()    — FaceRestorer: locate faces in image
-    3. restoreFaces()   — FaceRestorer: GFPGAN v1.3 AI restoration
-    4. parse()          — FaceParser: 19-class semantic segmentation
-    5. apply()          — RegionEnhancer: per-region processing (skin/eyes/lips/...)
-    6. [GlobalEnhancer] — Team member's module (exposure, color, contrast)
-    7. computeMetrics() — QualityMetrics: PSNR, SSIM, etc.
-    8. diffMap()        — Visual explanation of changes
+Architecture (post-orchestrator refactor):
+
+    1. analyzeImage()      ImageProfiler  — measure scene characteristics
+    2. DecisionEngine      profile        -> ordered list of layers to run
+    3. For each chosen layer:
+         a) execute the layer
+         b) QualityGuard compares before/after, reports trust score
+         c) accept / blend / reject the layer's output
+    4. computeMetrics() + diffMap() on final image
+
+Available layers (run only when DecisionEngine selects them):
+    GFPGAN          face_restorer.py        — face restoration
+    REAL_ESRGAN     general_restorer.py     — generic SR/denoise (NEW)
+    FACE_PARSE      semantic_parser.py      — 19-class face segmentation
+    REGION_ENHANCE  region_enhancer.py      — per-region cosmetic ops
+    GLOBAL_ENHANCE  global_enhancer.py      — Furkan's whole-image lift
 
 Team responsibilities:
-    Pixel Layer (Batuhan):     face detection + GFPGAN restoration
-    Semantic / Edge (Emir):    scene understanding contract (future mask_map)
-    Face parse + regions:      in-repo FaceParser + RegionEnhancer (integration path)
-    Global Layer (Furkan):     exposure, color balance, contrast (placeholder in pipeline)
+    Pixel + orchestrator (Batuhan):  GFPGAN, RealESRGAN, decisions, guards
+    Face parse + regions:            in-repo FaceParser + RegionEnhancer
+    Global Layer (Furkan):           GlobalEnhancer
 """
 
 from __future__ import annotations
@@ -29,10 +35,56 @@ import numpy as np
 
 from profiler import ImageProfiler, ProfileResult
 from face_restorer import FaceRestorer, RestorationResult
+from general_restorer import GeneralRestorer, GeneralRestorationResult
 from metrics import MetricsCalculator, QualityMetrics
 from semantic_parser import FaceParser, SemanticResult
 from region_enhancer import RegionEnhancer, RegionConfig, RegionEnhanceResult
-from global_enhancer import GlobalEnhancer, GlobalConfig, GlobalEnhanceResult
+from global_enhancer import GlobalEnhancer, GlobalEnhancerConfig
+from decision_engine import DecisionEngine, Layer, Plan
+from quality_guard import QualityGuard, GuardReport
+
+
+# ── Preset → component-config bridges ─────────────────────────────────
+#
+# A `ScenePreset` (see scene_presets.py) declares user-intent in coarse,
+# named knobs (skin_amount, eyes_sharpen, vibrance, ...).  These two
+# helpers translate that intent into the concrete `RegionConfig` and
+# `GlobalEnhancerConfig` instances each component already accepts, so
+# the chat layer can drive the pipeline without touching its internals.
+
+def _region_cfg_from_preset(preset) -> RegionConfig:
+    """Map a ScenePreset onto a RegionConfig (for RegionEnhancer)."""
+    return RegionConfig(
+        skin_smooth   = float(preset.skin_amount),
+        eye_sharpen   = float(preset.eyes_sharpen),
+        eye_brighten  = float(preset.eyes_bright),
+        lip_vibrance  = float(preset.lips_vibrance),
+        lip_warmth    = float(preset.lips_warmth),
+        brow_contrast = float(preset.brows_amount),
+        nose_sharpen  = float(preset.nose_amount),
+    )
+
+
+def _global_cfg_from_preset(preset) -> GlobalEnhancerConfig:
+    """
+    Map a ScenePreset onto a GlobalEnhancerConfig.
+
+    Preset fields default to None, in which case we fall back to the
+    standard GlobalEnhancer defaults — that way "natural" presets still
+    get sensible WB / sharpen even when they only override one knob.
+    """
+    base = GlobalEnhancerConfig()
+    return GlobalEnhancerConfig(
+        white_balance  = float(preset.white_balance) if preset.white_balance is not None else base.white_balance,
+        shadow_lift    = float(preset.shadow_lift)   if preset.shadow_lift   is not None else base.shadow_lift,
+        denoise        = float(preset.bilateral)     if preset.bilateral     is not None else base.denoise,
+        clahe_strength = (float(preset.clahe_clip) / 5.0
+                          if preset.clahe_clip is not None else base.clahe_strength),
+        hdr_tone       = float(preset.hdr)           if preset.hdr           is not None else base.hdr_tone,
+        sharpen        = float(preset.sharpen)       if preset.sharpen       is not None else base.sharpen,
+        vibrance       = float(preset.vibrance)      if preset.vibrance      is not None else base.vibrance,
+        film_look      = float(preset.film_grade)    if preset.film_grade    is not None else base.film_look,
+    )
 
 
 @dataclass
@@ -44,9 +96,11 @@ class EnhancementResult:
     profile:        Optional[ProfileResult] = None
     metrics:        Optional[QualityMetrics] = None
     restoration:    Optional[RestorationResult] = None
+    general_result: Optional[GeneralRestorationResult] = None
     semantic:       Optional[SemanticResult] = None
     region_result:  Optional[RegionEnhanceResult] = None
-    global_result:  Optional[GlobalEnhanceResult] = None
+    plan:           Optional[Plan] = None
+    guard_reports:  List[GuardReport] = field(default_factory=list)
     log:            List[str] = field(default_factory=list)
     success:        bool = False
 
@@ -66,7 +120,8 @@ class ImageEnhancementPipeline:
         upscale: int = 1,
         fidelity_weight: float = 0.5,
         region_config: Optional[RegionConfig] = None,
-        global_config: Optional[GlobalConfig] = None,
+        use_decision_engine: bool = True,
+        use_quality_guard: bool = True,
     ) -> None:
         self._profiler = ImageProfiler()
         self._metrics  = MetricsCalculator()
@@ -80,12 +135,19 @@ class ImageEnhancementPipeline:
             **kw,
         )
 
+        # General-purpose AI for non-face content
+        self._general = GeneralRestorer(scale=2, tile=512, output_scale=0.5)
+
         # Semantic layer: face parsing + per-region enhancement
         self._parser   = FaceParser()
         self._enhancer = RegionEnhancer(region_config)
 
-        # Global layer: scene-wide tonal correction (Furkan's primary layer)
-        self._global   = GlobalEnhancer(global_config)
+        # Global enhancement layer (Furkan)
+        self._global_enhancer = GlobalEnhancer()
+
+        # Orchestration helpers
+        self._engine = DecisionEngine() if use_decision_engine else None
+        self._guard  = QualityGuard()    if use_quality_guard  else None
 
     # ── public API ────────────────────────────────────────────────
 
@@ -98,6 +160,7 @@ class ImageEnhancementPipeline:
         image: np.ndarray,
         fidelity_weight: Optional[float] = None,
         only_center_face: bool = False,
+        preset=None,
     ) -> EnhancementResult:
         """
         Full pipeline: profile → GFPGAN restore → metrics → diff map.
@@ -107,7 +170,16 @@ class ImageEnhancementPipeline:
         image : np.ndarray      BGR uint8 input
         fidelity_weight : float 0=max AI, 1=original (override instance default)
         only_center_face : bool Process only the most central face
+        preset : ScenePreset    Optional scene-specific override bundle
+                                (see scene_presets.py). When given, its
+                                fidelity / force_* / skip_* fields override
+                                the slider value and the DecisionEngine plan
+                                so the same pipeline produces a recognisable
+                                look per scenario (portrait, old_photo,
+                                magazine, low_light, ...).
         """
+        if preset is not None and fidelity_weight is None:
+            fidelity_weight = float(preset.fidelity)
         result = EnhancementResult(original=image.copy() if image is not None else None)
         log = result.log
 
@@ -120,7 +192,7 @@ class ImageEnhancementPipeline:
             image.shape[1], image.shape[0],
             image.shape[0] * image.shape[1] / 1e6))
 
-        # Step 1: analyzeImage()
+        # ── Step 1: analyzeImage() ──
         profile = self.analyzeImage(image)
         result.profile = profile
         if profile:
@@ -139,53 +211,141 @@ class ImageEnhancementPipeline:
             log.append("  skin_ratio   = {:.3f} {}".format(
                 profile.skin_ratio,
                 "(FACE DETECTED)" if profile.has_skin else ""))
-            log.append("  scene flags  : {}".format(profile.summary()))
 
-        # Step 2+3: detectFaces() + restoreFaces() via FaceRestorer
-        log.append("--- GFPGAN Restoration ---")
-        resto = self._restorer.restore(
-            image,
-            fidelity_weight=fidelity_weight,
-            only_center_face=only_center_face,
-        )
-        result.restoration = resto
-        log.extend(resto.log)
-        log.append("  Faces found : {}".format(resto.faces_found))
-
-        if not resto.success or resto.restored is None:
-            log.append("[ERROR] Restoration failed — returning original")
-            result.restored = image
-            result.success = False
-            return result
-
-        result.restored = resto.restored
-
-        # Step 4: Global Layer — scene-wide tone correction (auto-exposure +
-        # CLAHE + saturation).  Runs before Semantic so face parsing operates
-        # on a properly-exposed image.
-        log.append("--- Global Layer ---")
-        gres = self._global.enhance(result.restored)
-        result.global_result = gres
-        log.extend("  " + ln for ln in gres.log)
-        if gres.success and gres.image is not None:
-            result.restored = gres.image
-
-        # Step 5: Semantic Layer — face parsing + per-region enhancement
-        log.append("--- Semantic Layer ---")
-        sem = self._parser.parse(result.restored)
-        result.semantic = sem
-        log.extend("  " + ln for ln in sem.log)
-
-        if sem.success and sem.faces:
-            reg = self._enhancer.apply(result.restored, sem)
-            result.region_result = reg
-            log.extend("  " + ln for ln in reg.log)
-            if reg.success and reg.image is not None:
-                result.restored = reg.image
-                log.append("  Region-enhanced image: applied to {} face(s)".format(
-                    len(sem.faces)))
+        # ── Step 2: DecisionEngine — decide which layers to execute ──
+        # Probe face count cheaply via the profile's skin ratio (engine
+        # treats skin > 4% as a positive face indicator).  We don't run
+        # the heavy face detector twice — the FaceRestorer call below
+        # will do its own detection if GFPGAN is in the plan.
+        if self._engine is not None:
+            plan = self._engine.decide(profile, faces_found=0,
+                                       image_shape=image.shape)
+            result.plan = plan
+            log.append("--- DecisionEngine ---")
+            log.extend(plan.justification())
         else:
-            log.append("  No faces parsed — semantic layer skipped")
+            plan = None
+
+        current = image.copy()  # this is the "rolling" image as layers run
+
+        # Preset overrides on the plan: a preset can force a layer on/off.
+        # We do this *after* the engine has explained itself, so the log
+        # still shows the engine's reasoning, and then the preset's
+        # override is recorded as an extra line.
+        if plan is not None and preset is not None:
+            for d in plan.steps:
+                if d.layer == Layer.REAL_ESRGAN:
+                    if preset.skip_general and d.run:
+                        d.run = False
+                        log.append("  [PRESET] REAL_ESRGAN forced OFF "
+                                   "by '{}' preset".format(preset.name))
+                    elif preset.force_general and not d.run:
+                        d.run = True
+                        log.append("  [PRESET] REAL_ESRGAN forced ON "
+                                   "by '{}' preset".format(preset.name))
+                if d.layer == Layer.GLOBAL_ENHANCE:
+                    if preset.skip_global and d.run:
+                        d.run = False
+                        log.append("  [PRESET] GLOBAL_ENHANCE forced OFF "
+                                   "by '{}' preset".format(preset.name))
+                    elif preset.force_global and not d.run:
+                        d.run = True
+                        log.append("  [PRESET] GLOBAL_ENHANCE forced ON "
+                                   "by '{}' preset".format(preset.name))
+
+        def _layer_should_run(layer: Layer) -> bool:
+            if plan is None:
+                return True   # all-on if engine disabled
+            for d in plan.steps:
+                if d.layer == layer:
+                    return d.run
+            return False
+
+        def _apply_guard(before, after, label, dst_attr):
+            """Run guard, append report, return image to use downstream."""
+            if self._guard is None or after is None:
+                return after
+            rep = self._guard.evaluate(before, after, label=label)
+            result.guard_reports.append(rep)
+            log.append(rep.log[0])
+            return rep.output
+
+        # ── Step 3: GFPGAN — face restoration ──
+        if _layer_should_run(Layer.GFPGAN):
+            log.append("--- GFPGAN Restoration ---")
+            resto = self._restorer.restore(
+                current,
+                fidelity_weight=fidelity_weight,
+                only_center_face=only_center_face,
+            )
+            result.restoration = resto
+            log.extend(resto.log)
+            log.append("  Faces found : {}".format(resto.faces_found))
+            if resto.success and resto.restored is not None:
+                current = _apply_guard(
+                    current, resto.restored, "GFPGAN", "restoration")
+
+        # ── Step 4: Real-ESRGAN — general AI for non-face / low-quality ──
+        if _layer_should_run(Layer.REAL_ESRGAN):
+            log.append("--- Real-ESRGAN ---")
+            gr = self._general.restore(current)
+            result.general_result = gr
+            log.extend(gr.log)
+            if gr.success and gr.restored is not None:
+                current = _apply_guard(
+                    current, gr.restored, "RealESRGAN", "general_result")
+
+        # ── Step 5: Face parse + region cosmetic ──
+        if _layer_should_run(Layer.FACE_PARSE):
+            log.append("--- Semantic Layer ---")
+            sem = self._parser.parse(current)
+            result.semantic = sem
+            log.extend("  " + ln for ln in sem.log)
+
+            if sem.success and sem.faces and _layer_should_run(Layer.REGION_ENHANCE):
+                # Preset overrides the per-region knobs; without one
+                # we use the pipeline's default RegionEnhancer so user
+                # preferences from __init__ are preserved.
+                if preset is not None:
+                    reg_enh = RegionEnhancer(_region_cfg_from_preset(preset))
+                    log.append("  [PRESET] region knobs from '{}' "
+                               "(skin={:.2f} eyes={:.2f} lips={:.2f})".format(
+                                   preset.name, preset.skin_amount,
+                                   preset.eyes_sharpen, preset.lips_vibrance))
+                else:
+                    reg_enh = self._enhancer
+                reg = reg_enh.apply(current, sem)
+                result.region_result = reg
+                log.extend("  " + ln for ln in reg.log)
+                if reg.success and reg.image is not None:
+                    current = _apply_guard(
+                        current, reg.image, "RegionEnhance", "region_result")
+
+        # ── Step 6: Global Enhancement (Furkan) ──
+        if _layer_should_run(Layer.GLOBAL_ENHANCE):
+            log.append("--- GlobalEnhancer ---")
+            try:
+                # Preset overrides the global knobs (WB, vibrance,
+                # sharpen, …). When absent, use the shared instance so
+                # the temporal frame buffer stays consistent.
+                if preset is not None:
+                    glob_enh = GlobalEnhancer(_global_cfg_from_preset(preset))
+                    log.append("  [PRESET] global knobs from '{}'".format(
+                        preset.name))
+                else:
+                    glob_enh = self._global_enhancer
+                ge = glob_enh.enhance(
+                    current, profile=profile, use_temporal=False)
+                if ge.success and ge.image is not None:
+                    log.extend("  " + ln for ln in ge.log)
+                    current = _apply_guard(
+                        current, ge.image, "GlobalEnhance", None)
+                else:
+                    log.append("  GlobalEnhancer returned no result -- passthrough")
+            except Exception as _e:
+                log.append("  [WARN] GlobalEnhancer failed: {}".format(_e))
+
+        result.restored = current
 
         # Step 6: Quality Metrics
         log.append("--- Quality Metrics ---")

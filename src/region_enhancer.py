@@ -36,15 +36,14 @@ from semantic_parser import SemanticResult, FaceParseResult
 @dataclass
 class RegionConfig:
     """Per-region intensity (0 = no effect, 1 = max effect)."""
-    skin_smooth:   float = 0.30      # lowered from 0.40 — preserve face structure
-    eye_sharpen:   float = 0.55
-    eye_brighten:  float = 0.18
-    lip_vibrance:  float = 0.40
-    lip_warmth:    float = 0.22
-    brow_contrast: float = 0.35
-    nose_sharpen:  float = 0.30
+    skin_smooth:   float = 0.55
+    eye_sharpen:   float = 0.70
+    eye_brighten:  float = 0.25
+    lip_vibrance:  float = 0.55
+    lip_warmth:    float = 0.30
+    brow_contrast: float = 0.45
+    nose_sharpen:  float = 0.35
     hair_denoise:  float = 0.00      # 0 = skip (NLM is slow)
-    face_clarity:  float = 0.40      # whole-face detail enhance (final pass)
 
     # Mask processing
     morph_open_px: int   = 3         # kernel radius for noise cleanup
@@ -152,19 +151,6 @@ def _proc_denoise(img: np.ndarray, amount: float) -> np.ndarray:
                                            searchWindowSize=15)
 
 
-def _proc_face_clarity(img: np.ndarray, amount: float) -> np.ndarray:
-    """Detail-preserving sharpening for the whole face area.
-
-    Uses cv2.detailEnhance (NPR) which boosts micro-contrast without
-    introducing halo artifacts, then linearly blends with the original
-    by `amount` so the strength scales smoothly.
-    """
-    sigma_s = 8.0 + amount * 6.0      # spatial smoothness
-    sigma_r = 0.10 + amount * 0.10    # range smoothness
-    enhanced = cv2.detailEnhance(img, sigma_s=sigma_s, sigma_r=sigma_r)
-    return cv2.addWeighted(img, 1.0 - amount, enhanced, amount, 0)
-
-
 # ── Main class ────────────────────────────────────────────────────────
 
 class RegionEnhancer:
@@ -235,10 +221,7 @@ class RegionEnhancer:
                 name, count, amount))
 
         # ── Eyes: sharpen then brighten through the same alpha ──
-        # Include eye_g (glasses) so lenses sharpen too — without this,
-        # users wearing glasses get blurry-feeling eyes.
-        eye_mask = _union_mask(semantic.faces,
-                               ["l_eye", "r_eye", "eye_g"], (H, W))
+        eye_mask = _union_mask(semantic.faces, ["l_eye", "r_eye"], (H, W))
         eye_mask = _clean_mask(eye_mask, cfg.morph_open_px)
         eye_count = int((eye_mask > 0).sum())
         if eye_count and (cfg.eye_sharpen > 0.001 or cfg.eye_brighten > 0.001):
@@ -269,27 +252,6 @@ class RegionEnhancer:
             result.applied["lips"] = lip_count
             self._log.append("  lips   px={:>7d}  vibr={:.2f} warm={:.2f}".format(
                 lip_count, cfg.lip_vibrance, cfg.lip_warmth))
-
-        # ── Face clarity (final pass, on top of all region ops) ──
-        # Detail-enhance the whole face area so structural lines (jaw, nose
-        # bridge, cheekbones) come back after skin smoothing.
-        if cfg.face_clarity > 0.001:
-            face_mask = _union_mask(
-                semantic.faces,
-                ["skin", "nose", "l_brow", "r_brow",
-                 "l_eye", "r_eye", "eye_g",
-                 "u_lip", "l_lip", "mouth"],
-                (H, W),
-            )
-            face_mask = _clean_mask(face_mask, cfg.morph_open_px)
-            face_count = int((face_mask > 0).sum())
-            if face_count:
-                alpha = _feather(face_mask, cfg.feather_px)
-                processed = _proc_face_clarity(out, cfg.face_clarity)
-                out = _blend(out, processed, alpha)
-                result.applied["face_clarity"] = face_count
-                self._log.append("  face   px={:>7d}  clarity={:.2f}".format(
-                    face_count, cfg.face_clarity))
 
         result.image = out
         result.success = True
