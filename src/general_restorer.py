@@ -185,23 +185,29 @@ class GeneralRestorer:
 
         if self._init_model():
             try:
-                # ── Adaptive resolution: downscale before AI if too big ──
-                # AI at half-res gives the same denoise/sharpen benefit at
-                # a fraction of the time, and the model's built-in x2
-                # super-resolution restores us to the original size.
+                # ── Always feed AI at half-resolution ──
+                # We use Real-ESRGAN for cleanup, NOT for true super-
+                # resolution: the GUI displays at original size and the
+                # model's x2 path itself doubles back to that size.
+                # Halving the input cuts CPU work ~4x with no visible
+                # quality loss (the network is far more capable than
+                # the input degradation it has to fix).
                 input_mp = (w0 * h0) / 1e6
                 if input_mp > self.max_process_mp:
+                    # Big input: downscale to fit budget (still smaller
+                    # than half-res for absurd inputs).
                     factor = (self.max_process_mp / input_mp) ** 0.5
-                    proc_w = max(64, int(w0 * factor))
-                    proc_h = max(64, int(h0 * factor))
-                    proc_img = cv2.resize(image, (proc_w, proc_h),
-                                          interpolation=cv2.INTER_AREA)
-                    result.log.append(
-                        "  Downscale {}x{} -> {}x{} ({:.2f} MP) for AI "
-                        "budget".format(w0, h0, proc_w, proc_h,
-                                        proc_w * proc_h / 1e6))
                 else:
-                    proc_img = image
+                    # Default: half-res for the AI pass, x2 brings us back
+                    factor = 0.5
+
+                proc_w = max(64, int(w0 * factor))
+                proc_h = max(64, int(h0 * factor))
+                proc_img = cv2.resize(image, (proc_w, proc_h),
+                                      interpolation=cv2.INTER_AREA)
+                result.log.append(
+                    "  AI input: {}x{} -> {}x{} ({:.2f} MP)".format(
+                        w0, h0, proc_w, proc_h, proc_w * proc_h / 1e6))
 
                 sr = self._infer(proc_img)
 
