@@ -75,6 +75,11 @@ class CameraCapture:
         self._w: int = 0
         self._h: int = 0
         self._fps: float = 0.0
+        # When the GUI's filter is slow, OpenCV's internal buffer fills
+        # up and frames lag a second or more behind reality.  We tell
+        # OpenCV to keep only the latest frame; backends that don't
+        # support this just ignore the call.
+        self._wants_low_latency = True
 
     # ── enumeration ───────────────────────────────────────────────
 
@@ -159,6 +164,14 @@ class CameraCapture:
             if height is not None:
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
+            # Low-latency hint: keep only latest frame in driver buffer.
+            # No-op on backends that don't expose CAP_PROP_BUFFERSIZE.
+            if self._wants_low_latency:
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+
             self._cap = cap
             self._index = index
             self._w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -178,14 +191,30 @@ class CameraCapture:
 
     # ── frame access ──────────────────────────────────────────────
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self, drain: bool = True) -> Optional[np.ndarray]:
         """
         Grab a single BGR uint8 frame. Returns None on failure.
 
+        Parameters
+        ----------
+        drain : bool
+            When True (default), discard any backlogged frames in the
+            driver queue and return the *latest* one. This kills the
+            lag that builds up when an upstream filter is slower than
+            the camera's native frame rate (e.g. ENHANCE at ~16 FPS
+            against a 30 FPS sensor would otherwise drift seconds
+            behind reality).
         Safe to call at GUI timer frequency (e.g. 30 FPS).
         """
         if self._cap is None or not self._cap.isOpened():
             return None
+        if drain:
+            # grab() is much cheaper than read() because it skips the
+            # YUV->BGR conversion. Drop any backlog, then decode the
+            # *next* frame.
+            for _ in range(2):
+                if not self._cap.grab():
+                    break
         ok, frame = self._cap.read()
         if not ok or frame is None:
             return None

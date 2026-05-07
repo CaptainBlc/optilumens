@@ -35,6 +35,11 @@ import numpy as np
 class BaseFilter:
     name = "BASE"
 
+    # Init/ready diagnostics — surfaced in the GUI status banner so the
+    # user can tell whether AI/ENHANCE actually loaded or fell back.
+    init_log: str = ""        # human-readable status of last init attempt
+    is_ready: bool = True     # True when the filter is operating "as advertised"
+
     def apply(self, frame: np.ndarray) -> np.ndarray:
         return frame
 
@@ -42,9 +47,14 @@ class BaseFilter:
         """Clear any internal cache."""
         pass
 
+    def set_params(self, **kwargs) -> None:
+        """Live-tunable parameters — overridden by Beauty / Enhance."""
+        pass
+
 
 class NoFilter(BaseFilter):
     name = "OFF"
+    init_log = "Pass-through — no processing"
 
 
 # ── Beauty: fast classical filter (real-time) ─────────────────────
@@ -70,6 +80,9 @@ class BeautyFilter(BaseFilter):
     _WARM_LUT_B = np.array([max(0, int(i * 0.95)) for i in range(256)],
                            dtype=np.uint8)
 
+    init_log = "Classical real-time filter ready (15-25 ms / frame)"
+    is_ready = True
+
     def __init__(self,
                  smooth_strength: float = 0.65,
                  clarity: float = 0.60,
@@ -78,6 +91,21 @@ class BeautyFilter(BaseFilter):
         self.clarity = float(np.clip(clarity, 0.0, 1.0))
         self.warmth  = float(np.clip(warmth, 0.0, 1.0))
         self._clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
+
+    def set_params(self, **kwargs) -> None:
+        """Live-tune Beauty knobs from a slider panel.
+
+        Accepts any of: smooth_strength, clarity, warmth (each 0..1).
+        Unknown keys are ignored so we can blanket-pass GUI state.
+        """
+        if "smooth_strength" in kwargs:
+            self.smooth  = float(np.clip(kwargs["smooth_strength"], 0.0, 1.0))
+        if "smooth" in kwargs:
+            self.smooth  = float(np.clip(kwargs["smooth"], 0.0, 1.0))
+        if "clarity" in kwargs:
+            self.clarity = float(np.clip(kwargs["clarity"], 0.0, 1.0))
+        if "warmth" in kwargs:
+            self.warmth  = float(np.clip(kwargs["warmth"], 0.0, 1.0))
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or frame.size == 0:
@@ -137,6 +165,8 @@ class EnhanceLiveFilter(BaseFilter):
     """Full real-time global enhancement filter for the live webcam feed."""
 
     name = "ENHANCE"
+    init_log = "(not initialised yet)"
+    is_ready = False
 
     def __init__(self) -> None:
         self._enhancer  = None
@@ -144,12 +174,29 @@ class EnhanceLiveFilter(BaseFilter):
         self._profile   = None
         self._frame_cnt = 0
         self._init_done = False
+        self._intensity = 1.0
 
     def reset(self) -> None:
         if self._enhancer is not None:
             self._enhancer.reset()
         self._frame_cnt = 0
         self._profile   = None
+
+    def set_params(self, **kwargs) -> None:
+        """Tune the global stack live. Accepts: intensity 0..1."""
+        if "intensity" in kwargs:
+            v = float(np.clip(kwargs["intensity"], 0.0, 1.0))
+            self._intensity = v
+            if self._enhancer is not None:
+                cfg = self._enhancer.cfg
+                cfg.white_balance  = 0.85 * v
+                cfg.shadow_lift    = 0.80 * v
+                cfg.denoise        = 0.60 * v
+                cfg.clahe_strength = 0.80 * v
+                cfg.hdr_tone       = 0.70 * v
+                cfg.sharpen        = 0.75 * v
+                cfg.vibrance       = 0.65 * v
+                cfg.film_look      = 0.60 * v
 
     def _ensure_init(self) -> bool:
         if self._init_done:
@@ -173,8 +220,12 @@ class EnhanceLiveFilter(BaseFilter):
             )
             self._enhancer = GlobalEnhancer(cfg)
             self._profiler = ImageProfiler()
+            self.is_ready  = True
+            self.init_log  = "GlobalEnhancer ready (~50-80 ms/frame, ~15 FPS)"
             return True
-        except Exception:
+        except Exception as ex:
+            self.is_ready = False
+            self.init_log = "GlobalEnhancer init failed: {}".format(ex)
             return False
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
@@ -215,6 +266,8 @@ class AIFilter(BaseFilter):
     """
 
     name = "AI"
+    init_log = "(not initialised yet)"
+    is_ready = False
 
     def __init__(self,
                  max_size: int = 512,
@@ -233,6 +286,13 @@ class AIFilter(BaseFilter):
         self._cached_shape = None
         self._frame_count = 0
 
+    def set_params(self, **kwargs) -> None:
+        """Tune AI filter live. Accepts: skip_frames (int), max_size (int)."""
+        if "skip_frames" in kwargs:
+            self.skip = max(1, int(kwargs["skip_frames"]))
+        if "max_size" in kwargs:
+            self.max_size = int(kwargs["max_size"])
+
     def _try_init(self) -> bool:
         if self._pipeline is not None:
             return True
@@ -242,8 +302,14 @@ class AIFilter(BaseFilter):
         try:
             from pipeline import ImageEnhancementPipeline  # lazy
             self._pipeline = ImageEnhancementPipeline(fidelity_weight=0.4)
+            self.is_ready  = True
+            self.init_log  = ("GFPGAN pipeline ready — face-restore every "
+                              "{} frames @ {}px".format(self.skip, self.max_size))
             return True
-        except Exception:
+        except Exception as ex:
+            self.is_ready = False
+            self.init_log = ("AI pipeline failed to init -> using BeautyFilter "
+                             "fallback. Reason: {}".format(ex))
             return False
 
     def apply(self, frame: np.ndarray) -> np.ndarray:

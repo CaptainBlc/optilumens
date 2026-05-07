@@ -44,6 +44,49 @@ from decision_engine import DecisionEngine, Layer, Plan
 from quality_guard import QualityGuard, GuardReport
 
 
+# ── Preset → component-config bridges ─────────────────────────────────
+#
+# A `ScenePreset` (see scene_presets.py) declares user-intent in coarse,
+# named knobs (skin_amount, eyes_sharpen, vibrance, ...).  These two
+# helpers translate that intent into the concrete `RegionConfig` and
+# `GlobalEnhancerConfig` instances each component already accepts, so
+# the chat layer can drive the pipeline without touching its internals.
+
+def _region_cfg_from_preset(preset) -> RegionConfig:
+    """Map a ScenePreset onto a RegionConfig (for RegionEnhancer)."""
+    return RegionConfig(
+        skin_smooth   = float(preset.skin_amount),
+        eye_sharpen   = float(preset.eyes_sharpen),
+        eye_brighten  = float(preset.eyes_bright),
+        lip_vibrance  = float(preset.lips_vibrance),
+        lip_warmth    = float(preset.lips_warmth),
+        brow_contrast = float(preset.brows_amount),
+        nose_sharpen  = float(preset.nose_amount),
+    )
+
+
+def _global_cfg_from_preset(preset) -> GlobalEnhancerConfig:
+    """
+    Map a ScenePreset onto a GlobalEnhancerConfig.
+
+    Preset fields default to None, in which case we fall back to the
+    standard GlobalEnhancer defaults — that way "natural" presets still
+    get sensible WB / sharpen even when they only override one knob.
+    """
+    base = GlobalEnhancerConfig()
+    return GlobalEnhancerConfig(
+        white_balance  = float(preset.white_balance) if preset.white_balance is not None else base.white_balance,
+        shadow_lift    = float(preset.shadow_lift)   if preset.shadow_lift   is not None else base.shadow_lift,
+        denoise        = float(preset.bilateral)     if preset.bilateral     is not None else base.denoise,
+        clahe_strength = (float(preset.clahe_clip) / 5.0
+                          if preset.clahe_clip is not None else base.clahe_strength),
+        hdr_tone       = float(preset.hdr)           if preset.hdr           is not None else base.hdr_tone,
+        sharpen        = float(preset.sharpen)       if preset.sharpen       is not None else base.sharpen,
+        vibrance       = float(preset.vibrance)      if preset.vibrance      is not None else base.vibrance,
+        film_look      = float(preset.film_grade)    if preset.film_grade    is not None else base.film_look,
+    )
+
+
 @dataclass
 class EnhancementResult:
     """Complete output from one pipeline run."""
@@ -117,6 +160,7 @@ class ImageEnhancementPipeline:
         image: np.ndarray,
         fidelity_weight: Optional[float] = None,
         only_center_face: bool = False,
+        preset=None,
     ) -> EnhancementResult:
         """
         Full pipeline: profile → GFPGAN restore → metrics → diff map.
@@ -126,7 +170,16 @@ class ImageEnhancementPipeline:
         image : np.ndarray      BGR uint8 input
         fidelity_weight : float 0=max AI, 1=original (override instance default)
         only_center_face : bool Process only the most central face
+        preset : ScenePreset    Optional scene-specific override bundle
+                                (see scene_presets.py). When given, its
+                                fidelity / force_* / skip_* fields override
+                                the slider value and the DecisionEngine plan
+                                so the same pipeline produces a recognisable
+                                look per scenario (portrait, old_photo,
+                                magazine, low_light, ...).
         """
+        if preset is not None and fidelity_weight is None:
+            fidelity_weight = float(preset.fidelity)
         result = EnhancementResult(original=image.copy() if image is not None else None)
         log = result.log
 
@@ -174,6 +227,31 @@ class ImageEnhancementPipeline:
             plan = None
 
         current = image.copy()  # this is the "rolling" image as layers run
+
+        # Preset overrides on the plan: a preset can force a layer on/off.
+        # We do this *after* the engine has explained itself, so the log
+        # still shows the engine's reasoning, and then the preset's
+        # override is recorded as an extra line.
+        if plan is not None and preset is not None:
+            for d in plan.steps:
+                if d.layer == Layer.REAL_ESRGAN:
+                    if preset.skip_general and d.run:
+                        d.run = False
+                        log.append("  [PRESET] REAL_ESRGAN forced OFF "
+                                   "by '{}' preset".format(preset.name))
+                    elif preset.force_general and not d.run:
+                        d.run = True
+                        log.append("  [PRESET] REAL_ESRGAN forced ON "
+                                   "by '{}' preset".format(preset.name))
+                if d.layer == Layer.GLOBAL_ENHANCE:
+                    if preset.skip_global and d.run:
+                        d.run = False
+                        log.append("  [PRESET] GLOBAL_ENHANCE forced OFF "
+                                   "by '{}' preset".format(preset.name))
+                    elif preset.force_global and not d.run:
+                        d.run = True
+                        log.append("  [PRESET] GLOBAL_ENHANCE forced ON "
+                                   "by '{}' preset".format(preset.name))
 
         def _layer_should_run(layer: Layer) -> bool:
             if plan is None:
@@ -225,7 +303,18 @@ class ImageEnhancementPipeline:
             log.extend("  " + ln for ln in sem.log)
 
             if sem.success and sem.faces and _layer_should_run(Layer.REGION_ENHANCE):
-                reg = self._enhancer.apply(current, sem)
+                # Preset overrides the per-region knobs; without one
+                # we use the pipeline's default RegionEnhancer so user
+                # preferences from __init__ are preserved.
+                if preset is not None:
+                    reg_enh = RegionEnhancer(_region_cfg_from_preset(preset))
+                    log.append("  [PRESET] region knobs from '{}' "
+                               "(skin={:.2f} eyes={:.2f} lips={:.2f})".format(
+                                   preset.name, preset.skin_amount,
+                                   preset.eyes_sharpen, preset.lips_vibrance))
+                else:
+                    reg_enh = self._enhancer
+                reg = reg_enh.apply(current, sem)
                 result.region_result = reg
                 log.extend("  " + ln for ln in reg.log)
                 if reg.success and reg.image is not None:
@@ -236,7 +325,16 @@ class ImageEnhancementPipeline:
         if _layer_should_run(Layer.GLOBAL_ENHANCE):
             log.append("--- GlobalEnhancer ---")
             try:
-                ge = self._global_enhancer.enhance(
+                # Preset overrides the global knobs (WB, vibrance,
+                # sharpen, …). When absent, use the shared instance so
+                # the temporal frame buffer stays consistent.
+                if preset is not None:
+                    glob_enh = GlobalEnhancer(_global_cfg_from_preset(preset))
+                    log.append("  [PRESET] global knobs from '{}'".format(
+                        preset.name))
+                else:
+                    glob_enh = self._global_enhancer
+                ge = glob_enh.enhance(
                     current, profile=profile, use_temporal=False)
                 if ge.success and ge.image is not None:
                     log.extend("  " + ln for ln in ge.log)

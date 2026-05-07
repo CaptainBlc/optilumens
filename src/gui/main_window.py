@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSlider, QCheckBox, QTextEdit, QLineEdit, QFrame,
     QFileDialog, QSplitter, QApplication, QSizePolicy,
     QGridLayout, QButtonGroup, QDialog, QProgressBar,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
 )
 from PyQt6.QtCore import Qt, QRect, QPoint, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
@@ -104,18 +104,20 @@ QLabel { color: #ddd; }
 class EnhanceWorker(QThread):
     done = pyqtSignal(object)
 
-    def __init__(self, pipeline, image, fidelity, center_only):
+    def __init__(self, pipeline, image, fidelity, center_only, preset=None):
         super().__init__()
         self._pipe = pipeline
         self._img = image
         self._fw = fidelity
         self._center = center_only
+        self._preset = preset      # ScenePreset or None
 
     def run(self):
         result = self._pipe.restoreImage(
             self._img,
             fidelity_weight=self._fw,
             only_center_face=self._center,
+            preset=self._preset,
         )
         self.done.emit(result)
 
@@ -412,6 +414,10 @@ class MainWindow(QMainWindow):
         self._prof = ImageProfiler()
         self._view = self.V_ORIG
         self._worker = None
+        # Active scene preset (set by chat: "fix this old photo",
+        # "make it look professional", etc.). None means use slider only.
+        self._active_preset = None
+        self._lastResult = None
 
         # Live camera state (Analysis Report Scenario 4)
         self._cam = CameraCapture()
@@ -423,6 +429,12 @@ class MainWindow(QMainWindow):
         # Live filter (Sprint 4 — Analysis §3.5.1 #4 ext.)
         self._filter: BaseFilter = make_filter("OFF")
         self._filter_name: str = "OFF"
+
+        # Live FPS / latency telemetry — rendered as overlay on preview
+        self._fps_ema: float = 0.0
+        self._fps_last_ts: float = 0.0
+        self._filter_ms_ema: float = 0.0
+        self._cam_devices = []     # last enumeration result
 
         self._build_menu()
         self._build_ui()
@@ -486,6 +498,11 @@ class MainWindow(QMainWindow):
         self._bLive.clicked.connect(self._toggle_live)
         tl.addWidget(self._bLive)
 
+        # Camera picker — only visible when >1 device or after enumeration
+        self._camPick = QComboBox(); self._camPick.setVisible(False)
+        self._camPick.setMinimumWidth(150)
+        tl.addWidget(self._camPick)
+
         self._bShot = QPushButton("Capture"); self._bShot.setVisible(False)
         self._bShot.clicked.connect(self._capture_shot)
         tl.addWidget(self._bShot)
@@ -503,6 +520,29 @@ class MainWindow(QMainWindow):
             if i == 0: b.setChecked(True)
             self._fgrp.addButton(b, i); self._fbtns.append(b); tl.addWidget(b)
         self._fgrp.idClicked.connect(self._set_filter)
+
+        # Live filter parameters (Beauty smoothness / warmth, Enhance intensity).
+        # Hidden by default; revealed when an applicable filter is active.
+        self._sldSmooth = QSlider(Qt.Orientation.Horizontal)
+        self._sldSmooth.setRange(0, 100); self._sldSmooth.setValue(65)
+        self._sldSmooth.setFixedWidth(80); self._sldSmooth.setVisible(False)
+        self._sldSmooth.setToolTip("Skin smoothness (Beauty)")
+        self._sldSmooth.valueChanged.connect(self._on_filter_param)
+        tl.addWidget(self._sldSmooth)
+
+        self._sldWarm = QSlider(Qt.Orientation.Horizontal)
+        self._sldWarm.setRange(0, 100); self._sldWarm.setValue(35)
+        self._sldWarm.setFixedWidth(80); self._sldWarm.setVisible(False)
+        self._sldWarm.setToolTip("Warmth / colour temperature (Beauty)")
+        self._sldWarm.valueChanged.connect(self._on_filter_param)
+        tl.addWidget(self._sldWarm)
+
+        self._sldInt = QSlider(Qt.Orientation.Horizontal)
+        self._sldInt.setRange(0, 100); self._sldInt.setValue(100)
+        self._sldInt.setFixedWidth(80); self._sldInt.setVisible(False)
+        self._sldInt.setToolTip("Filter intensity (Enhance)")
+        self._sldInt.valueChanged.connect(self._on_filter_param)
+        tl.addWidget(self._sldInt)
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
         sep2.setStyleSheet("color:#2a2a2a;"); tl.addWidget(sep2); tl.addSpacing(4)
@@ -799,12 +839,15 @@ class MainWindow(QMainWindow):
 
         fw = self._sldFW.value() / 100.0
         center_only = self._ckCenter.isChecked()
+        preset = getattr(self, "_active_preset", None)
 
-        self._worker = EnhanceWorker(self._pipe, self._orig, fw, center_only)
+        self._worker = EnhanceWorker(
+            self._pipe, self._orig, fw, center_only, preset=preset)
         self._worker.done.connect(self._on_done)
         self._worker.start()
 
     def _on_done(self, result):
+        self._lastResult = result
         if result.success and result.restored is not None:
             self._rest = result.restored
             self._dif  = result.diff_map
@@ -815,6 +858,10 @@ class MainWindow(QMainWindow):
 
             # ── Decision panel + trust scores (post-orchestrator) ─────
             extra = []
+            preset = getattr(self, "_active_preset", None)
+            if preset is not None:
+                extra.append("Preset         : {}".format(preset.name))
+                extra.append("                 {}".format(preset.description))
             if result.restoration:
                 extra.append("Faces restored : {}".format(
                     result.restoration.faces_found))
@@ -839,6 +886,8 @@ class MainWindow(QMainWindow):
 
     def _reset(self):
         self._rest = self._dif = None
+        self._active_preset = None       # clear chat-driven preset
+        self._lastResult    = None
         self._bSave.setEnabled(False); self._clr_met()
         self._histLbl.setPixmap(QPixmap()); self._logW.clear()
         self._view = self.V_ORIG; self._vbtns[0].setChecked(True); self._chg_view(0)
@@ -930,23 +979,41 @@ class MainWindow(QMainWindow):
             self._stop_live()
 
     def _start_live(self):
-        cams = CameraCapture.list_cameras(max_devices=3)
+        # Enumerate every probe-able backend so the user gets the full
+        # list (built-in + USB + IP-webcam mappings).
+        cams = CameraCapture.list_cameras(max_devices=4)
+        self._cam_devices = cams
         if not cams:
             self._bLive.setChecked(False)
             self._logW.setHtml(self._html_log([
                 "[ERROR] No camera device found.",
-                "  Check that a webcam is connected and not used by another app.",
+                "  - Check that a webcam is connected (built-in or USB).",
+                "  - Close any app that might be holding it (Zoom/Teams/OBS).",
+                "  - On laptops, the camera privacy switch must be ON.",
             ]))
             return
 
-        if not self._cam.open(cams[0].index, width=1280, height=720):
+        # Populate the picker — show it only when there is a real choice.
+        self._camPick.blockSignals(True)
+        self._camPick.clear()
+        for c in cams:
+            self._camPick.addItem(c.name, userData=c.index)
+        self._camPick.setVisible(len(cams) > 1)
+        self._camPick.blockSignals(False)
+        try:
+            self._camPick.currentIndexChanged.disconnect()
+        except TypeError:
+            pass
+        self._camPick.currentIndexChanged.connect(self._switch_camera)
+
+        chosen = cams[0].index
+        if not self._cam.open(chosen, width=1280, height=720):
             self._bLive.setChecked(False)
             self._logW.setHtml(self._html_log([
-                "[ERROR] Failed to open camera at index {}".format(cams[0].index),
+                "[ERROR] Failed to open camera at index {}".format(chosen),
             ]))
             return
 
-        # Switch to LIVE view
         self._view = self.V_LIVE
         self._vpS.setVisible(True)
         self._vpC.setVisible(False)
@@ -958,19 +1025,40 @@ class MainWindow(QMainWindow):
         self._bLoad.setEnabled(False); self._bRest.setEnabled(False)
         self._bRset.setEnabled(False)
 
-        info = self._cam.info()
-        self._infoLbl.setText("LIVE MODE\n" + info +
-            "\n\nFilter: " + self._filter_name +
-            "\nPress Capture to grab a frame\nand run GFPGAN enhancement.")
+        # Reset telemetry counters
+        self._fps_ema = 0.0; self._filter_ms_ema = 0.0; self._fps_last_ts = 0.0
+
+        self._update_filter_panel_visibility()
+        self._refresh_info_panel()
 
         self._logW.setHtml(self._html_log([
             "=== Live Camera Mode ===",
-            "  {}".format(info),
-            "  Available devices: {}".format(len(cams)),
-            "  Preview running at ~30 FPS",
-            "  Press 'Capture' to snapshot → GFPGAN pipeline",
+            "  {}".format(self._cam.info()),
+            "  Devices: " + ", ".join(c.name for c in cams),
+            "  Buffer:  low-latency (drains stale frames)",
+            "  Filter:  {} -- {}".format(
+                self._filter_name, getattr(self._filter, "init_log", "")),
+            "  Press 'Capture' to grab a frame -> GFPGAN pipeline",
         ]))
         self._cam_timer.start()
+
+    def _switch_camera(self, picker_idx: int):
+        """Toolbar dropdown changed -> hot-swap the active device."""
+        if picker_idx < 0 or picker_idx >= len(self._cam_devices):
+            return
+        target = self._cam_devices[picker_idx].index
+        was_running = self._cam_timer.isActive()
+        self._cam_timer.stop()
+        self._cam.close()
+        if not self._cam.open(target, width=1280, height=720):
+            self._logW.setHtml(self._html_log([
+                "[WARN] Could not switch to camera index {}".format(target),
+            ]))
+            return
+        self._fps_ema = 0.0; self._filter_ms_ema = 0.0; self._fps_last_ts = 0.0
+        self._refresh_info_panel()
+        if was_running:
+            self._cam_timer.start()
 
     def _stop_live(self):
         self._cam_timer.stop()
@@ -979,7 +1067,11 @@ class MainWindow(QMainWindow):
 
         self._bShot.setVisible(False)
         self._filterLbl.setVisible(False)
+        self._camPick.setVisible(False)
         for b in self._fbtns: b.setVisible(False)
+        self._sldSmooth.setVisible(False)
+        self._sldWarm.setVisible(False)
+        self._sldInt.setVisible(False)
         self._bLoad.setEnabled(True)
         self._bRset.setEnabled(self._orig is not None)
         self._bRest.setEnabled(self._orig is not None)
@@ -990,10 +1082,14 @@ class MainWindow(QMainWindow):
         self._vbtns[0].setChecked(True); self._chg_view(self.V_ORIG)
 
     def _cam_tick(self):
-        frame = self._cam.read()
+        # Drain the driver buffer so we always show the *latest* frame —
+        # otherwise a slow filter (ENHANCE/AI) makes the preview drift.
+        frame = self._cam.read(drain=True)
         if frame is None:
             return
-        # Apply the active live filter before display (Sprint 4).
+
+        import time as _t
+        t0 = _t.perf_counter()
         display = frame
         try:
             display = self._filter.apply(frame)
@@ -1001,29 +1097,106 @@ class MainWindow(QMainWindow):
                 display = frame
         except Exception:
             display = frame
-        self._cam_frame = frame  # keep the raw frame for snapshot
+        filt_ms = (_t.perf_counter() - t0) * 1000.0
+
+        # Wall-clock FPS, smoothed
+        if self._fps_last_ts > 0:
+            dt = _t.perf_counter() - self._fps_last_ts
+            inst = (1.0 / dt) if dt > 0 else 0.0
+            self._fps_ema = 0.85 * self._fps_ema + 0.15 * inst if self._fps_ema else inst
+        self._fps_last_ts = _t.perf_counter()
+        self._filter_ms_ema = (0.85 * self._filter_ms_ema + 0.15 * filt_ms
+                               if self._filter_ms_ema else filt_ms)
+
+        self._cam_frame = frame  # raw frame -- snapshot uses this
+        display = self._draw_overlay(display)
 
         if self._filter_name == "ENHANCE":
             if not self._vpC.isVisible():
-                self._vpS.setVisible(False)
-                self._vpC.setVisible(True)
+                self._vpS.setVisible(False); self._vpC.setVisible(True)
             self._vpC.set_images(self._pm(frame), self._pm(display))
         else:
             if not self._vpS.isVisible():
-                self._vpS.setVisible(True)
-                self._vpC.setVisible(False)
+                self._vpS.setVisible(True); self._vpC.setVisible(False)
             self._vpS.img(self._pm(display))
+
+    def _draw_overlay(self, img: np.ndarray) -> np.ndarray:
+        """Render an FPS/filter HUD on the live preview frame."""
+        if img is None or img.size == 0:
+            return img
+        out = img.copy()
+        ready_tag = "OK" if getattr(self._filter, "is_ready", True) else "FALLBACK"
+        line1 = "{:>6.1f} FPS  |  {:>5.1f} ms".format(
+            self._fps_ema, self._filter_ms_ema)
+        line2 = "{} ({})".format(self._filter_name, ready_tag)
+        H, W = out.shape[:2]
+        # Translucent box behind the text
+        box_w = 220 if W >= 480 else 180
+        cv2.rectangle(out, (8, 8), (8 + box_w, 64),
+                      (0, 0, 0), thickness=cv2.FILLED)
+        cv2.rectangle(out, (8, 8), (8 + box_w, 64), (60, 60, 60), 1)
+        cv2.putText(out, line1, (16, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (250, 250, 250), 1, cv2.LINE_AA)
+        ok_color = (130, 230, 130) if ready_tag == "OK" else (90, 165, 240)
+        cv2.putText(out, line2, (16, 52), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, ok_color, 1, cv2.LINE_AA)
+        return out
+
+    def _refresh_info_panel(self) -> None:
+        if not self._cam.is_open:
+            return
+        ready = "OK" if getattr(self._filter, "is_ready", True) else "FALLBACK"
+        ilog  = getattr(self._filter, "init_log", "") or ""
+        self._infoLbl.setText(
+            "LIVE MODE\n{}\n\nFilter : {}  [{}]\n  {}\n\n"
+            "Press 'Capture' to grab a frame\n"
+            "and run the full pipeline.".format(
+                self._cam.info(), self._filter_name, ready, ilog))
+
+    def _update_filter_panel_visibility(self) -> None:
+        """Show/hide the smoothness/warmth/intensity sliders by filter."""
+        is_beauty  = self._filter_name == "BEAUTY"
+        is_enhance = self._filter_name == "ENHANCE"
+        self._sldSmooth.setVisible(is_beauty)
+        self._sldWarm.setVisible(is_beauty)
+        self._sldInt.setVisible(is_enhance)
+
+    def _on_filter_param(self) -> None:
+        """Toolbar slider moved -> push live-tunable params into the filter."""
+        try:
+            if self._filter_name == "BEAUTY":
+                self._filter.set_params(
+                    smooth_strength=self._sldSmooth.value() / 100.0,
+                    warmth=self._sldWarm.value() / 100.0,
+                )
+            elif self._filter_name == "ENHANCE":
+                self._filter.set_params(
+                    intensity=self._sldInt.value() / 100.0,
+                )
+        except Exception:
+            pass
 
     def _set_filter(self, idx: int):
         names = ["OFF", "BEAUTY", "ENHANCE", "AI"]
         if 0 <= idx < len(names):
             self._filter_name = names[idx]
             self._filter = make_filter(self._filter_name)
+            # Push current slider values into the freshly-created filter
+            self._on_filter_param()
+            self._update_filter_panel_visibility()
             if self._cam.is_open:
-                self._infoLbl.setText(
-                    "LIVE MODE\n{}\n\nFilter: {}\nPress Capture to grab a frame\n"
-                    "and run GFPGAN enhancement.".format(
-                        self._cam.info(), self._filter_name))
+                # Trigger lazy init for ENHANCE/AI so the banner is honest
+                if self._filter_name in ("ENHANCE", "AI"):
+                    try:
+                        self._filter.apply(np.zeros((64, 64, 3), dtype=np.uint8))
+                    except Exception:
+                        pass
+                self._refresh_info_panel()
+                ready = "OK" if getattr(self._filter, "is_ready", True) else "FALLBACK"
+                self._logW.append(
+                    "<div style='color:#888'>[FILTER] {} -> {}: {}</div>".format(
+                        self._filter_name, ready,
+                        getattr(self._filter, "init_log", "")))
 
     def _capture_shot(self):
         if not self._cam.is_open:
