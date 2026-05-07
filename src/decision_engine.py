@@ -110,6 +110,7 @@ class DecisionEngine:
         profile: Optional[ProfileResult],
         faces_found: int = 0,
         image_shape: Optional[Tuple[int, int, int]] = None,
+        preset_name: Optional[str] = None,
     ) -> Plan:
         """Build an execution Plan."""
         plan = Plan()
@@ -125,6 +126,21 @@ class DecisionEngine:
         h, w = (image_shape[:2] if image_shape else (0, 0))
         mp = (h * w) / 1e6 if (h and w) else 0.0
         thr = self.thr
+        pn = (preset_name or "").strip().lower()
+        # Preset-aware threshold tuning: keep it simple and audit-friendly.
+        # WOW/MAGAZINE/VIDID aim for stronger visible effects, so we:
+        # - treat "already sharp" more strictly (lower blur_sharp)
+        # - allow cosmetics more often (even if looks_fine)
+        if pn in ("wow", "magazine", "vivid"):
+            thr = EngineThresholds(
+                blur_sharp=180.0,
+                blur_acceptable=55.0,
+                noise_clean=thr.noise_clean,
+                noise_high=thr.noise_high,
+                skin_face_min=thr.skin_face_min,
+                low_res_mp=thr.low_res_mp,
+                high_res_mp=thr.high_res_mp,
+            )
 
         has_face = (faces_found > 0) or (
             profile.has_skin and profile.skin_ratio >= thr.skin_face_min)
@@ -168,7 +184,12 @@ class DecisionEngine:
             general_reason = (
                 "image absurdly large ({:.1f} MP > {:.1f} MP) -- skip "
                 "to avoid extreme latency".format(mp, thr.high_res_mp))
-        elif profile.is_blurry or is_noisy or low_res:
+        elif (
+            profile.is_blurry
+            or is_noisy
+            or profile.is_low_light
+            or (low_res and (very_blurry or very_noisy or profile.contrast < 0.18))
+        ):
             run_general = True
             general_reason = (
                 "AI cleanup useful (blurry={}, noisy={}, low_res={})".format(
@@ -198,7 +219,10 @@ class DecisionEngine:
             not profile.is_blurry and
             not profile.is_noisy
         )
-        run_cosmetic = has_face and (not looks_fine)
+        if pn in ("wow", "magazine", "vivid"):
+            run_cosmetic = has_face and (not profile.is_overexposed)
+        else:
+            run_cosmetic = has_face and (not looks_fine)
 
         if has_face:
             plan.steps.append(Decision(
@@ -233,7 +257,7 @@ class DecisionEngine:
                 "image already overexposed (brightness={:.2f}) -- global stack "
                 "would push tones further; skip to keep fidelity".format(
                     profile.brightness))
-        elif looks_fine:
+        elif looks_fine and pn not in ("wow", "magazine", "vivid"):
             run_global = False
             global_reason = (
                 "image already well-balanced (bright/contrast/noise/blur all OK) "

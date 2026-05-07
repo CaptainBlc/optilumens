@@ -192,6 +192,37 @@ PRESETS: Dict[str, ScenePreset] = {
         ],
     ),
 
+    # 5d) WOW — presentation mode (strong but guarded)
+    #
+    # Goal: visible "phone AI" wow factor across most images.
+    # Still guarded by QualityGuard; if it drifts too much it blends/rejects.
+    "wow": ScenePreset(
+        name="wow",
+        description="Presentation mode — stronger beauty + punch (still guarded).",
+        fidelity=0.55,
+        skin_amount=0.70, nose_amount=0.40, brows_amount=0.55,
+        eyes_sharpen=0.85, eyes_bright=0.35,
+        lips_vibrance=0.80, lips_warmth=0.35,
+        force_global=True,
+        # Real-ESRGAN is expensive on CPU; only force it when the profile really needs it
+        # (pipeline adds a small conditional override for WOW).
+        force_general=False,
+        white_balance=0.55,
+        shadow_lift=0.40,
+        bilateral=0.35,
+        clahe_clip=2.3,
+        hdr=0.35,
+        sharpen=0.55,
+        vibrance=0.45,
+        film_grade=0.18,
+        triggers=[
+            "wow", "make it wow", "super", "ultra", "beautify", "beauty max",
+            "vivid+", "presentation", "show mode",
+            "wow yap", "wow modu", "sunum", "sunum modu",
+            "maksimum", "ultra", "çok güçlü", "super güçlü",
+        ],
+    ),
+
     # 6) Low-light — shadow lift + denoise
     "low_light": ScenePreset(
         name="low_light",

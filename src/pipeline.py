@@ -29,9 +29,12 @@ Team responsibilities:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import time
 
 import numpy as np
+import cv2
 
 from profiler import ImageProfiler, ProfileResult
 from face_restorer import FaceRestorer, RestorationResult
@@ -87,6 +90,64 @@ def _global_cfg_from_preset(preset) -> GlobalEnhancerConfig:
     )
 
 
+def _clamp01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+
+def _wow_dynamic_global_cfg(preset, profile: Optional[ProfileResult]) -> GlobalEnhancerConfig:
+    """
+    Dynamic WOW mapping:
+    - Low-light: lift/denoise up, vibrance/film down (avoid colour drift)
+    - Blurry/noisy: sharpen down, denoise up (avoid halos)
+    - Clean/bright: allow more punch (vibrance/sharpen up)
+    """
+    cfg = _global_cfg_from_preset(preset)
+    if profile is None:
+        return cfg
+
+    b = float(getattr(profile, "brightness", 0.50))
+    low = bool(getattr(profile, "is_low_light", False))
+    blurry = bool(getattr(profile, "is_blurry", False))
+    noisy = bool(getattr(profile, "is_noisy", False))
+
+    # brightness below ~0.55 => low-light strength factor 0..1
+    darkness = max(0.0, 0.55 - b) / 0.25
+    darkness = max(0.0, min(1.0, darkness))
+
+    # multipliers
+    m_lift = 1.0 + 0.35 * darkness if low else 1.0
+    m_dn   = 1.0 + (0.40 * darkness if low else 0.0) + (0.25 if noisy else 0.0)
+    m_sh   = 1.0 - (0.25 if blurry else 0.0) - (0.10 if noisy else 0.0)
+    m_vib  = 1.0 - (0.22 if low else 0.0) - (0.08 if noisy else 0.0)
+    m_film = 1.0 - (0.35 if low else 0.0)
+
+    cfg.shadow_lift = _clamp01(cfg.shadow_lift * m_lift)
+    cfg.denoise     = _clamp01(cfg.denoise * m_dn)
+    cfg.sharpen     = _clamp01(cfg.sharpen * m_sh)
+    cfg.vibrance    = _clamp01(cfg.vibrance * m_vib)
+    cfg.film_look   = _clamp01(cfg.film_look * m_film)
+    return cfg
+
+
+def _wow_dynamic_region_cfg(preset, profile: Optional[ProfileResult]) -> RegionConfig:
+    """
+    Dynamic WOW cosmetics:
+    - Low-light/noisy: reduce sharpening a bit (avoid crunchy artifacts)
+    - Clean: keep strong cosmetics for the wow factor
+    """
+    cfg = _region_cfg_from_preset(preset)
+    if profile is None:
+        return cfg
+    low = bool(getattr(profile, "is_low_light", False))
+    blurry = bool(getattr(profile, "is_blurry", False))
+    noisy = bool(getattr(profile, "is_noisy", False))
+    if low or blurry or noisy:
+        k = 0.85 if (low or noisy) else 0.90
+        cfg.eye_sharpen = _clamp01(cfg.eye_sharpen * k)
+        cfg.nose_sharpen = _clamp01(cfg.nose_sharpen * k)
+        cfg.brow_contrast = _clamp01(cfg.brow_contrast * (0.90 if noisy else 0.95))
+    return cfg
+
 def _preset_has_global_overrides(preset) -> bool:
     """True if preset explicitly overrides any global-enhancer knob."""
     if preset is None:
@@ -95,6 +156,31 @@ def _preset_has_global_overrides(preset) -> bool:
         "white_balance", "shadow_lift", "bilateral", "clahe_clip",
         "hdr", "sharpen", "vibrance", "film_grade",
     ))
+
+
+def _low_light_natural_global_cfg(profile: Optional[ProfileResult]) -> GlobalEnhancerConfig:
+    """
+    Mild global configuration for Natural+/Group in low-light.
+
+    Goal: lift shadows + reduce noise without triggering large colour/tone drift
+    (which would get rejected by QualityGuard anyway).
+    """
+    b = float(getattr(profile, "brightness", 0.50))
+    # darker scene → slightly stronger lift/denoise; keep colour operations conservative
+    darkness = max(0.0, 0.55 - b)
+    lift = min(0.70, 0.45 + darkness * 0.90)
+    denoise = min(0.55, 0.30 + darkness * 0.70)
+    return GlobalEnhancerConfig(
+        white_balance=0.55,
+        shadow_lift=lift,
+        denoise=denoise,
+        clahe_strength=0.28,
+        hdr_tone=0.22,
+        sharpen=0.28,
+        vibrance=0.18,
+        film_look=0.08,
+        temporal_frames=3,
+    )
 
 
 @dataclass
@@ -112,6 +198,7 @@ class EnhancementResult:
     plan:           Optional[Plan] = None
     guard_reports:  List[GuardReport] = field(default_factory=list)
     log:            List[str] = field(default_factory=list)
+    timings_ms:     Dict[str, float] = field(default_factory=dict)  # per-layer wall time
     success:        bool = False
 
 
@@ -192,6 +279,13 @@ class ImageEnhancementPipeline:
             fidelity_weight = float(preset.fidelity)
         result = EnhancementResult(original=image.copy() if image is not None else None)
         log = result.log
+        timings = result.timings_ms
+
+        def _timeit(key: str, fn):
+            t0 = time.perf_counter()
+            out = fn()
+            timings[key] = (time.perf_counter() - t0) * 1000.0
+            return out
 
         if image is None or image.size == 0:
             log.append("[ERROR] Invalid input")
@@ -203,7 +297,7 @@ class ImageEnhancementPipeline:
             image.shape[0] * image.shape[1] / 1e6))
 
         # ── Step 1: analyzeImage() ──
-        profile = self.analyzeImage(image)
+        profile = _timeit("analyze", lambda: self.analyzeImage(image))
         result.profile = profile
         if profile:
             log.append("--- analyzeImage() ---")
@@ -228,8 +322,15 @@ class ImageEnhancementPipeline:
         # the heavy face detector twice — the FaceRestorer call below
         # will do its own detection if GFPGAN is in the plan.
         if self._engine is not None:
-            plan = self._engine.decide(profile, faces_found=0,
-                                       image_shape=image.shape)
+            plan = _timeit(
+                "decide",
+                lambda: self._engine.decide(
+                    profile,
+                    faces_found=0,
+                    image_shape=image.shape,
+                    preset_name=str(getattr(preset, "name", "")) if preset is not None else None,
+                ),
+            )
             result.plan = plan
             log.append("--- DecisionEngine ---")
             log.extend(plan.justification())
@@ -244,15 +345,53 @@ class ImageEnhancementPipeline:
         # override is recorded as an extra line.
         if plan is not None and preset is not None:
             for d in plan.steps:
+                # Presentation tuning: WOW should look strong but must not feel broken/laggy.
+                # On CPU, GFPGAN + Real-ESRGAN together can easily exceed 4s. We keep WOW's
+                # punch primarily via Region+Global, and only run heavy AI when it is likely
+                # to materially improve quality.
+                pn = str(getattr(preset, "name", "") or "").lower()
+                if pn == "wow" and profile is not None:
+                    # GFPGAN: run only when the face really needs restoration (very blurry or low-light).
+                    # Otherwise skip to avoid a ~3s stall.
+                    if d.layer == Layer.GFPGAN and d.run:
+                        very_blur = float(getattr(profile, "blur_score", 0.0)) < 60.0
+                        low_light = bool(getattr(profile, "is_low_light", False))
+                        if not (very_blur or low_light):
+                            d.run = False
+                            log.append("  [WOW] GFPGAN suppressed (perf) — not very blurry / low-light")
+
+                    # Real-ESRGAN: run when needed (very blurry, low-light, noisy, or very low contrast).
+                    if d.layer == Layer.REAL_ESRGAN and d.run:
+                        very_blur = bool(getattr(profile, "is_blurry", False)) and float(getattr(profile, "blur_score", 0.0)) < 60.0
+                        low_light = bool(getattr(profile, "is_low_light", False))
+                        noisy = bool(getattr(profile, "is_noisy", False))
+                        low_contrast = float(getattr(profile, "contrast", 1.0)) < 0.18
+                        if not (very_blur or low_light or noisy or low_contrast):
+                            d.run = False
+                            log.append("  [WOW] REAL_ESRGAN suppressed (perf) — frame is clean enough")
+
                 if d.layer == Layer.REAL_ESRGAN:
                     if preset.skip_general and d.run:
                         d.run = False
                         log.append("  [PRESET] REAL_ESRGAN forced OFF "
                                    "by '{}' preset".format(preset.name))
                     elif preset.force_general and not d.run:
-                        d.run = True
-                        log.append("  [PRESET] REAL_ESRGAN forced ON "
-                                   "by '{}' preset".format(preset.name))
+                        # Even when a preset asks for SR/denoise, avoid forcing it on
+                        # perfectly clean frames: Real-ESRGAN is the slowest CPU layer
+                        # after GFPGAN and can add 1s+ latency at VGA resolutions.
+                        needs_general = bool(
+                            getattr(profile, "is_low_light", False)
+                            or getattr(profile, "is_blurry", False)
+                            or getattr(profile, "is_noisy", False)
+                            or (profile is not None and float(getattr(profile, "contrast", 1.0)) < 0.18)
+                        )
+                        if needs_general:
+                            d.run = True
+                            log.append("  [PRESET] REAL_ESRGAN forced ON "
+                                       "by '{}' preset (needs cleanup)".format(preset.name))
+                        else:
+                            log.append("  [PRESET] REAL_ESRGAN force suppressed "
+                                       "on clean frame (perf) by '{}' preset".format(preset.name))
                 if d.layer == Layer.GLOBAL_ENHANCE:
                     if preset.skip_global and d.run:
                         d.run = False
@@ -282,7 +421,8 @@ class ImageEnhancementPipeline:
                 pn = str(getattr(preset, "name", "") or "").lower()
                 if pn in ("natural", "natural_plus", "group"):
                     if label == "GlobalEnhance":
-                        guard = QualityGuard(accept_threshold=75.0, warn_threshold=60.0, blend_ratio=0.60)
+                        # Global passes can drift colour/tone; prefer blending over hard reject
+                        guard = QualityGuard(accept_threshold=74.0, warn_threshold=50.0, blend_ratio=0.65)
                     elif label == "RegionEnhance":
                         guard = QualityGuard(accept_threshold=75.0, warn_threshold=60.0, blend_ratio=0.55)
                     elif label == "GFPGAN":
@@ -298,10 +438,13 @@ class ImageEnhancementPipeline:
         # ── Step 3: GFPGAN — face restoration ──
         if _layer_should_run(Layer.GFPGAN):
             log.append("--- GFPGAN Restoration ---")
-            resto = self._restorer.restore(
-                current,
-                fidelity_weight=fidelity_weight,
-                only_center_face=only_center_face,
+            resto = _timeit(
+                "gfpgan",
+                lambda: self._restorer.restore(
+                    current,
+                    fidelity_weight=fidelity_weight,
+                    only_center_face=only_center_face,
+                ),
             )
             result.restoration = resto
             log.extend(resto.log)
@@ -313,7 +456,7 @@ class ImageEnhancementPipeline:
         # ── Step 4: Real-ESRGAN — general AI for non-face / low-quality ──
         if _layer_should_run(Layer.REAL_ESRGAN):
             log.append("--- Real-ESRGAN ---")
-            gr = self._general.restore(current)
+            gr = _timeit("realesrgan", lambda: self._general.restore(current))
             result.general_result = gr
             log.extend(gr.log)
             if gr.success and gr.restored is not None:
@@ -323,7 +466,29 @@ class ImageEnhancementPipeline:
         # ── Step 5: Face parse + region cosmetic ──
         if _layer_should_run(Layer.FACE_PARSE):
             log.append("--- Semantic Layer ---")
-            sem = self._parser.parse(current)
+            pn_preset = str(getattr(preset, "name", "") or "").lower() if preset is not None else ""
+            # Performance: face parsing (RetinaFace + BiSeNet) can be very slow on CPU.
+            # For "wow" we accept doing cosmetics on a smaller proxy image and upscaling
+            # the final cosmetic result back; Guard still protects the output.
+            fast_cosmetic = pn_preset == "wow"
+            base_img = current
+            if fast_cosmetic:
+                try:
+                    h0, w0 = base_img.shape[:2]
+                    target = 320
+                    if max(h0, w0) > target:
+                        s = target / float(max(h0, w0))
+                        base_img = cv2.resize(
+                            base_img,
+                            (max(1, int(w0 * s)), max(1, int(h0 * s))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        log.append("  [WOW] fast cosmetic proxy: {}x{} -> {}x{}".format(
+                            w0, h0, base_img.shape[1], base_img.shape[0]))
+                except Exception:
+                    base_img = current
+
+            sem = _timeit("face_parse", lambda: self._parser.parse(base_img))
             result.semantic = sem
             log.extend("  " + ln for ln in sem.log)
 
@@ -332,19 +497,34 @@ class ImageEnhancementPipeline:
                 # we use the pipeline's default RegionEnhancer so user
                 # preferences from __init__ are preserved.
                 if preset is not None:
-                    reg_enh = RegionEnhancer(_region_cfg_from_preset(preset))
+                    pn_cfg = str(getattr(preset, "name", "") or "").lower()
+                    if pn_cfg == "wow":
+                        reg_cfg = _wow_dynamic_region_cfg(preset, profile)
+                        reg_enh = RegionEnhancer(reg_cfg)
+                        log.append("  [WOW] dynamic region cfg applied")
+                    else:
+                        reg_enh = RegionEnhancer(_region_cfg_from_preset(preset))
                     log.append("  [PRESET] region knobs from '{}' "
                                "(skin={:.2f} eyes={:.2f} lips={:.2f})".format(
                                    preset.name, preset.skin_amount,
                                    preset.eyes_sharpen, preset.lips_vibrance))
                 else:
                     reg_enh = self._enhancer
-                reg = reg_enh.apply(current, sem)
+                reg = _timeit("region", lambda: reg_enh.apply(base_img, sem))
                 result.region_result = reg
                 log.extend("  " + ln for ln in reg.log)
                 if reg.success and reg.image is not None:
+                    out_img = reg.image
+                    if fast_cosmetic and out_img.shape[:2] != current.shape[:2]:
+                        try:
+                            out_img = cv2.resize(
+                                out_img, (current.shape[1], current.shape[0]),
+                                interpolation=cv2.INTER_LINEAR,
+                            )
+                        except Exception:
+                            out_img = reg.image
                     current = _apply_guard(
-                        current, reg.image, "RegionEnhance", "region_result")
+                        current, out_img, "RegionEnhance", "region_result")
 
         # ── Step 6: Global Enhancement (Furkan) ──
         if _layer_should_run(Layer.GLOBAL_ENHANCE):
@@ -353,14 +533,28 @@ class ImageEnhancementPipeline:
                 # Preset overrides the global knobs (WB, vibrance,
                 # sharpen, …). When absent, use the shared instance so
                 # the temporal frame buffer stays consistent.
-                if preset is not None and _preset_has_global_overrides(preset):
-                    glob_enh = GlobalEnhancer(_global_cfg_from_preset(preset))
-                    log.append("  [PRESET] global overrides from '{}'".format(
-                        preset.name))
+                pn = str(getattr(preset, "name", "") or "").lower() if preset is not None else ""
+                if pn in ("natural_plus", "group") and (
+                    getattr(profile, "is_low_light", False) or getattr(profile, "is_blurry", False)
+                ):
+                    glob_enh = GlobalEnhancer(_low_light_natural_global_cfg(profile))
+                    tag = "low-light" if getattr(profile, "is_low_light", False) else "blurry"
+                    log.append("  [PRESET] mild global ({}) for '{}'".format(tag, pn))
+                elif preset is not None and _preset_has_global_overrides(preset):
+                    pn2 = str(getattr(preset, "name", "") or "").lower()
+                    if pn2 == "wow":
+                        glob_enh = GlobalEnhancer(_wow_dynamic_global_cfg(preset, profile))
+                        log.append("  [WOW] dynamic global cfg applied")
+                    else:
+                        glob_enh = GlobalEnhancer(_global_cfg_from_preset(preset))
+                        log.append("  [PRESET] global overrides from '{}'".format(
+                            preset.name))
                 else:
                     glob_enh = self._global_enhancer
-                ge = glob_enh.enhance(
-                    current, profile=profile, use_temporal=False)
+                ge = _timeit(
+                    "global",
+                    lambda: glob_enh.enhance(current, profile=profile, use_temporal=False),
+                )
                 if ge.success and ge.image is not None:
                     log.extend("  " + ln for ln in ge.log)
                     current = _apply_guard(
@@ -375,7 +569,7 @@ class ImageEnhancementPipeline:
         # Step 6: Quality Metrics
         log.append("--- Quality Metrics ---")
         try:
-            m = self._metrics.compute_all(image, result.restored)
+            m = _timeit("metrics", lambda: self._metrics.compute_all(image, result.restored))
             result.metrics = m
             log.append("  PSNR         = {:.2f} dB".format(m.psnr))
             log.append("  SSIM         = {:.4f}".format(m.ssim))
@@ -390,11 +584,21 @@ class ImageEnhancementPipeline:
 
         # Step 7: Difference map
         try:
-            result.diff_map = self._metrics.difference_map(image, result.restored)
+            result.diff_map = _timeit(
+                "diff_map", lambda: self._metrics.difference_map(image, result.restored)
+            )
             log.append("  Difference map: generated")
         except Exception as e:
             log.append("[WARN] Diff map failed: {}".format(e))
 
         result.success = True
+        if timings:
+            total = sum(timings.values())
+            keys = ["analyze", "decide", "gfpgan", "realesrgan", "face_parse", "region", "global", "metrics", "diff_map"]
+            shown = ["{}={:.0f}ms".format(k, timings[k]) for k in keys if k in timings and timings[k] >= 1.0]
+            log.append("--- Timing ---")
+            log.append("  Total: {:.0f} ms".format(total))
+            if shown:
+                log.append("  " + "  ".join(shown))
         log.append("=== Pipeline completed ===")
         return result

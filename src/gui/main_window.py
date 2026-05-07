@@ -224,11 +224,16 @@ class Viewport(QLabel):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
         self._px = None
+        self._live_fast = False
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet(
             "background:#0e0e0e; border:1px solid #2a2a2a;"
             "border-radius:6px; color:#555;")
+
+    def set_live_mode(self, on: bool) -> None:
+        self._live_fast = bool(on)
+        self._fit()
 
     def img(self, pm):
         self._px = pm; self._fit()
@@ -238,9 +243,12 @@ class Viewport(QLabel):
 
     def _fit(self):
         if self._px and not self._px.isNull():
+            mode = (Qt.TransformationMode.FastTransformation
+                    if self._live_fast
+                    else Qt.TransformationMode.SmoothTransformation)
             super().setPixmap(self._px.scaled(
                 self.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
+                mode))
 
     def resizeEvent(self, e):
         super().resizeEvent(e); self._fit()
@@ -704,10 +712,16 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _pm(img):
-        r = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, c = r.shape
-        return QPixmap.fromImage(
-            QImage(r.data.tobytes(), w, h, c * w, QImage.Format.Format_RGB888))
+        # Live performance: avoid full-frame .tobytes() copy when possible.
+        h, w = img.shape[:2]
+        try:
+            # Qt6 supports BGR888; this skips cvtColor.
+            qimg = QImage(img.data, w, h, img.strides[0], QImage.Format.Format_BGR888)
+            return QPixmap.fromImage(qimg)
+        except Exception:
+            r = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            qimg = QImage(r.data, w, h, r.strides[0], QImage.Format.Format_RGB888)
+            return QPixmap.fromImage(qimg)
 
     def _hist_pm(self):
         W, H = RIGHT_W - CARD_PAD * 2 - 4, 50
@@ -1009,7 +1023,9 @@ class MainWindow(QMainWindow):
         self._camPick.currentIndexChanged.connect(self._switch_camera)
 
         chosen = cams[0].index
-        if not self._cam.open(chosen, width=1280, height=720):
+        # Live preview is CPU-bound when filters are enabled; 960x540 keeps the
+        # UI responsive while still looking sharp on a typical laptop display.
+        if not self._cam.open(chosen, width=960, height=540):
             self._bLive.setChecked(False)
             self._logW.setHtml(self._html_log([
                 "[ERROR] Failed to open camera at index {}".format(chosen),
@@ -1019,6 +1035,7 @@ class MainWindow(QMainWindow):
         self._view = self.V_LIVE
         self._vpS.setVisible(True)
         self._vpC.setVisible(False)
+        self._vpS.set_live_mode(True)
         for b in self._vbtns: b.setChecked(False)
 
         self._bShot.setVisible(True)
@@ -1052,7 +1069,7 @@ class MainWindow(QMainWindow):
         was_running = self._cam_timer.isActive()
         self._cam_timer.stop()
         self._cam.close()
-        if not self._cam.open(target, width=1280, height=720):
+        if not self._cam.open(target, width=960, height=540):
             self._logW.setHtml(self._html_log([
                 "[WARN] Could not switch to camera index {}".format(target),
             ]))
@@ -1080,6 +1097,7 @@ class MainWindow(QMainWindow):
 
         self._vpC.setVisible(False)
         self._vpS.setVisible(True)
+        self._vpS.set_live_mode(False)
         self._view = self.V_ORIG
         self._vbtns[0].setChecked(True); self._chg_view(self.V_ORIG)
 
@@ -1113,14 +1131,32 @@ class MainWindow(QMainWindow):
         self._cam_frame = frame  # raw frame -- snapshot uses this
         display = self._draw_overlay(display)
 
-        if self._filter_name == "ENHANCE":
-            if not self._vpC.isVisible():
-                self._vpS.setVisible(False); self._vpC.setVisible(True)
-            self._vpC.set_images(self._pm(frame), self._pm(display))
-        else:
-            if not self._vpS.isVisible():
-                self._vpS.setVisible(True); self._vpC.setVisible(False)
-            self._vpS.img(self._pm(display))
+        # NOTE (performance): In live mode, converting full-res frames to two
+        # QPixmaps every 33 ms is expensive (especially for ENHANCE). We show a
+        # single preview stream and downscale to the viewport size before
+        # RGB conversion to keep FPS high.
+        if not self._vpS.isVisible():
+            self._vpS.setVisible(True)
+        if self._vpC.isVisible():
+            self._vpC.setVisible(False)
+
+        try:
+            W = max(1, self._vpS.width())
+            H = max(1, self._vpS.height())
+            dh, dw = display.shape[:2]
+            scale = min(W / max(1, dw), H / max(1, dh), 1.0)
+            if scale < 1.0:
+                disp_small = cv2.resize(
+                    display,
+                    (max(1, int(dw * scale)), max(1, int(dh * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                disp_small = display
+        except Exception:
+            disp_small = display
+
+        self._vpS.img(self._pm(disp_small))
 
     def _draw_overlay(self, img: np.ndarray) -> np.ndarray:
         """Render an FPS/filter HUD on the live preview frame."""
@@ -1208,6 +1244,23 @@ class MainWindow(QMainWindow):
             self._logW.setHtml(self._html_log(["[ERROR] Snapshot failed"]))
             return
 
+        # Performance: live cameras often deliver 720p/1080p; running the full
+        # pipeline on that resolution on CPU (especially Real-ESRGAN) is slow.
+        # Downscale the snapshot to a sane max side for interactive demos.
+        try:
+            h0, w0 = snap.shape[:2]
+            max_side = max(h0, w0)
+            target = 480  # keeps face models effective; much faster for ESRGAN/parse
+            if max_side > target:
+                s = target / max_side
+                snap = cv2.resize(
+                    snap,
+                    (max(1, int(w0 * s)), max(1, int(h0 * s))),
+                    interpolation=cv2.INTER_AREA,
+                )
+        except Exception:
+            pass
+
         # If a live filter is active, the user probably wants its look
         # preserved in the snapshot. Apply it once to the stabilised frame.
         filter_used = self._filter_name
@@ -1222,6 +1275,15 @@ class MainWindow(QMainWindow):
         self._cam_timer.stop()
         self._bLive.setChecked(False)
         self._stop_live()
+
+        # Live snapshots should look "wow" by default for presentation, even when the
+        # DecisionEngine thinks the frame is already clean. Use the WOW preset for
+        # captured live frames unless the user already picked something else.
+        try:
+            if getattr(self, "_active_preset", None) is None or getattr(self._active_preset, "name", "") in ("natural_plus", "modern_touch"):
+                self._active_preset = PRESETS.get("wow") or self._active_preset
+        except Exception:
+            pass
 
         # Feed snapshot as if it were a loaded image
         self._orig = snap

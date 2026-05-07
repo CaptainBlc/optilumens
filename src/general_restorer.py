@@ -269,6 +269,19 @@ class GeneralRestorer:
         """Tile-aware inference. Returns BGR uint8, scale × spatial size."""
         import torch as _torch
 
+        # Some Real-ESRGAN arches require H/W divisible by scale.
+        # Pad to the next multiple, then crop back after inference.
+        h0, w0 = image_bgr.shape[:2]
+        s = max(1, int(self.scale))
+        pad_h = (-h0) % s
+        pad_w = (-w0) % s
+        if pad_h or pad_w:
+            image_bgr = cv2.copyMakeBorder(
+                image_bgr,
+                0, pad_h, 0, pad_w,
+                borderType=cv2.BORDER_REFLECT_101,
+            )
+
         # BGR uint8 → RGB float32 [0,1] → tensor [1,3,H,W]
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         x = _torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
@@ -284,6 +297,8 @@ class GeneralRestorer:
 
         y = y.clamp(0, 1).float().squeeze(0).permute(1, 2, 0).cpu().numpy()
         bgr = cv2.cvtColor((y * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        if pad_h or pad_w:
+            bgr = bgr[: h0 * s, : w0 * s]
         return bgr
 
     def _tiled_inference(self, x):
