@@ -162,6 +162,36 @@ PRESETS: Dict[str, ScenePreset] = {
         ],
     ),
 
+    # 5c) Modern touch — always apply a *mild* global pass (safe phone look)
+    #
+    # Use this when users explicitly want "make it look better" even if the
+    # image is already clean. Guardrails still apply, so over-processing
+    # is blended/rejected automatically.
+    "modern_touch": ScenePreset(
+        name="modern_touch",
+        description="Always-on mild global polish (natural phone-style).",
+        fidelity=0.70,
+        skin_amount=0.35, nose_amount=0.22, brows_amount=0.28,
+        eyes_sharpen=0.45, eyes_bright=0.18,
+        lips_vibrance=0.35, lips_warmth=0.18,
+        force_global=True,
+        # Mild global overrides (preset maps clahe_clip/5 → clahe_strength)
+        white_balance=0.40,
+        shadow_lift=0.25,
+        bilateral=0.20,
+        clahe_clip=1.5,
+        hdr=0.20,
+        sharpen=0.25,
+        vibrance=0.20,
+        film_grade=0.10,
+        triggers=[
+            "modern touch", "polish", "make it better", "enhance", "remaster",
+            "phone enhance", "samsung ai", "iphone look",
+            "iyilestir", "iyileştir", "parlat", "duzelt", "düzelt",
+            "remaster", "guzellestir", "güzelleştir",
+        ],
+    ),
+
     # 6) Low-light — shadow lift + denoise
     "low_light": ScenePreset(
         name="low_light",

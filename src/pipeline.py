@@ -87,6 +87,16 @@ def _global_cfg_from_preset(preset) -> GlobalEnhancerConfig:
     )
 
 
+def _preset_has_global_overrides(preset) -> bool:
+    """True if preset explicitly overrides any global-enhancer knob."""
+    if preset is None:
+        return False
+    return any(getattr(preset, k, None) is not None for k in (
+        "white_balance", "shadow_lift", "bilateral", "clahe_clip",
+        "hdr", "sharpen", "vibrance", "film_grade",
+    ))
+
+
 @dataclass
 class EnhancementResult:
     """Complete output from one pipeline run."""
@@ -265,7 +275,22 @@ class ImageEnhancementPipeline:
             """Run guard, append report, return image to use downstream."""
             if self._guard is None or after is None:
                 return after
-            rep = self._guard.evaluate(before, after, label=label)
+            # Preset-specific guardrails: for "natural" looks we tighten
+            # thresholds and blend more aggressively to avoid over-processing.
+            guard = self._guard
+            if preset is not None:
+                pn = str(getattr(preset, "name", "") or "").lower()
+                if pn in ("natural", "natural_plus", "group"):
+                    if label == "GlobalEnhance":
+                        guard = QualityGuard(accept_threshold=75.0, warn_threshold=60.0, blend_ratio=0.60)
+                    elif label == "RegionEnhance":
+                        guard = QualityGuard(accept_threshold=75.0, warn_threshold=60.0, blend_ratio=0.55)
+                    elif label == "GFPGAN":
+                        guard = QualityGuard(accept_threshold=72.0, warn_threshold=55.0, blend_ratio=0.50)
+                    elif label == "RealESRGAN":
+                        guard = QualityGuard(accept_threshold=72.0, warn_threshold=55.0, blend_ratio=0.45)
+
+            rep = guard.evaluate(before, after, label=label)
             result.guard_reports.append(rep)
             log.append(rep.log[0])
             return rep.output
@@ -328,9 +353,9 @@ class ImageEnhancementPipeline:
                 # Preset overrides the global knobs (WB, vibrance,
                 # sharpen, …). When absent, use the shared instance so
                 # the temporal frame buffer stays consistent.
-                if preset is not None:
+                if preset is not None and _preset_has_global_overrides(preset):
                     glob_enh = GlobalEnhancer(_global_cfg_from_preset(preset))
-                    log.append("  [PRESET] global knobs from '{}'".format(
+                    log.append("  [PRESET] global overrides from '{}'".format(
                         preset.name))
                 else:
                     glob_enh = self._global_enhancer

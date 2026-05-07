@@ -187,14 +187,29 @@ class DecisionEngine:
             Layer.REAL_ESRGAN, run_general, general_reason, priority=20))
 
         # ── Layer 3: Face Parse + Region Enhance (cosmetic per-region) ──
+        #
+        # This step is what gives the "phone beauty" look, but it can also
+        # make already-good modern photos look over-processed. Therefore:
+        # - If the image already looks fine (not low-light, not noisy, not blurry),
+        #   we SKIP cosmetics by default. Users can still force it via presets.
+        looks_fine = (
+            not profile.is_low_light and
+            not profile.is_overexposed and
+            not profile.is_blurry and
+            not profile.is_noisy
+        )
+        run_cosmetic = has_face and (not looks_fine)
+
         if has_face:
             plan.steps.append(Decision(
-                Layer.FACE_PARSE, True,
-                "face present → 19-class semantic parse for region-aware processing",
+                Layer.FACE_PARSE, run_cosmetic,
+                "face present → parse needed for cosmetics" if run_cosmetic else
+                "face present but image already clean — skip cosmetic parsing by default",
                 priority=30))
             plan.steps.append(Decision(
-                Layer.REGION_ENHANCE, True,
-                "apply per-region cosmetic enhancement (skin / eyes / lips / brows)",
+                Layer.REGION_ENHANCE, run_cosmetic,
+                "apply per-region cosmetic enhancement" if run_cosmetic else
+                "cosmetics skipped — preserve natural rendering",
                 priority=40))
         else:
             plan.steps.append(Decision(
@@ -212,12 +227,6 @@ class DecisionEngine:
         # Running it on a clean, well-lit, in-focus image overcooks the
         # output (purple/lavender wash, exaggerated saturation). Skip it
         # in those cases to preserve fidelity.
-        looks_fine = (
-            not profile.is_low_light and
-            not profile.is_overexposed and
-            not profile.is_blurry and
-            not profile.is_noisy
-        )
         if profile.is_overexposed:
             run_global = False
             global_reason = (
