@@ -169,9 +169,21 @@ class QualityGuard:
         drift = float(np.mean(np.abs(
             after_cmp.astype(np.int16) - before.astype(np.int16)))) / 255.0
 
-        # Trust score: SSIM dominates, drift is a soft penalty
+        # Trust score: SSIM is structural, drift catches color/tone shifts
+        # that SSIM (luminance-only) misses. The previous 0.85/0.15 weights
+        # let aggressive global passes through with drift ~0.16 because
+        # SSIM stayed high; that produced visible purple/lavender washes.
+        # The 0.6/0.4 split with a 5x drift slope penalises colour swings
+        # without hurting genuinely useful enhancements (drift < 0.06).
         ssim01 = max(0.0, min(1.0, ssim))
-        score = 100.0 * (0.85 * ssim01 + 0.15 * (1.0 - min(1.0, drift * 4.0)))
+        score = 100.0 * (0.6 * ssim01 + 0.4 * (1.0 - min(1.0, drift * 5.0)))
+
+        # Hard cap: catastrophic colour drift is always at least a BLEND.
+        # A single channel shifting 18% on average is the kind of damage
+        # we never want to silently accept, even if SSIM is forgiving.
+        if drift > 0.18 and score >= self.accept:
+            score = self.warn  # forces the blend branch below
+
         score = float(max(0.0, min(100.0, score)))
 
         rep.ssim = float(ssim01)

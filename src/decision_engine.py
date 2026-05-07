@@ -199,14 +199,35 @@ class DecisionEngine:
                 "depends on FACE_PARSE — cascade skip",
                 priority=40))
 
-        # ── Layer 4: Global Enhancement — almost always useful ──
-        run_global = True
-        global_reason = "always-on whole-image quality lift (Furkan's layer)"
-        if profile.is_overexposed and profile.contrast > 0.30:
+        # ── Layer 4: Global Enhancement — only when image actually needs it ──
+        # GlobalEnhancer applies an aggressive multi-stage stack (white
+        # balance + shadow lift + CLAHE + HDR + vibrance + film grade).
+        # Running it on a clean, well-lit, in-focus image overcooks the
+        # output (purple/lavender wash, exaggerated saturation). Skip it
+        # in those cases to preserve fidelity.
+        looks_fine = (
+            not profile.is_low_light and
+            not profile.is_overexposed and
+            not profile.is_blurry and
+            not profile.is_noisy
+        )
+        if profile.is_overexposed:
+            run_global = False
             global_reason = (
-                "still useful but conservative — image overexposed "
-                "(brightness={:.2f}) so global will tone it back".format(
+                "image already overexposed (brightness={:.2f}) -- global stack "
+                "would push tones further; skip to keep fidelity".format(
                     profile.brightness))
+        elif looks_fine:
+            run_global = False
+            global_reason = (
+                "image already well-balanced (bright/contrast/noise/blur all OK) "
+                "-- skipping global pass to avoid over-processing")
+        else:
+            run_global = True
+            global_reason = (
+                "image needs global help "
+                "(low_light={}, blurry={}, noisy={})".format(
+                    profile.is_low_light, profile.is_blurry, profile.is_noisy))
         plan.steps.append(Decision(
             Layer.GLOBAL_ENHANCE, run_global, global_reason, priority=50))
 
