@@ -200,9 +200,17 @@ class StyleGAN2GeneratorCSFT(nn.Module):
                 style_t.append(truncation_latent + truncation * (s - truncation_latent))
             styles = style_t
 
-        # Replicate or mix styles
+        # Replicate or mix styles.
+        # GFPGAN with `different_w=True` passes a single 3D tensor
+        # of shape (B, num_latents, F) — already the per-layer style
+        # code — so use it directly. Otherwise we receive 2D codes
+        # (B, F) and need to expand to per-layer.
         if len(styles) == 1:
-            latent = styles[0].unsqueeze(1).repeat(1, self.num_latents, 1)
+            s = styles[0]
+            if s.dim() == 3:
+                latent = s
+            else:
+                latent = s.unsqueeze(1).repeat(1, self.num_latents, 1)
         elif len(styles) == 2:
             inject_index = inject_index or random.randint(1, self.num_latents - 1)
             latent1 = styles[0].unsqueeze(1).repeat(1, inject_index, 1)

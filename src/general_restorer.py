@@ -102,6 +102,7 @@ class GeneralRestorer:
         tile_pad: int = 16,
         output_scale: float = 0.5,
         half: bool = False,
+        max_process_mp: float = 4.0,
     ) -> None:
         self._ckpt = checkpoint_path or _DEFAULT_CKPT
         self.scale = int(scale)
@@ -109,6 +110,11 @@ class GeneralRestorer:
         self.tile_pad = max(0, int(tile_pad))
         self.output_scale = float(output_scale)
         self.half = bool(half)
+        # Cap how much pixel volume goes through the AI. 4 MP processes
+        # in ~5-15 s on CPU; anything larger is downsampled to fit, run,
+        # then upscaled back so the user still gets the AI cleanup
+        # without paying full-resolution latency.
+        self.max_process_mp = float(max_process_mp)
 
         self._model = None
         self._device = None
@@ -179,19 +185,39 @@ class GeneralRestorer:
 
         if self._init_model():
             try:
-                sr = self._infer(image)
-                target_w = max(1, int(round(w0 * self.scale * self.output_scale)))
-                target_h = max(1, int(round(h0 * self.scale * self.output_scale)))
-                if (sr.shape[1], sr.shape[0]) != (target_w, target_h):
-                    sr = cv2.resize(sr, (target_w, target_h),
+                # ── Adaptive resolution: downscale before AI if too big ──
+                # AI at half-res gives the same denoise/sharpen benefit at
+                # a fraction of the time, and the model's built-in x2
+                # super-resolution restores us to the original size.
+                input_mp = (w0 * h0) / 1e6
+                if input_mp > self.max_process_mp:
+                    factor = (self.max_process_mp / input_mp) ** 0.5
+                    proc_w = max(64, int(w0 * factor))
+                    proc_h = max(64, int(h0 * factor))
+                    proc_img = cv2.resize(image, (proc_w, proc_h),
+                                          interpolation=cv2.INTER_AREA)
+                    result.log.append(
+                        "  Downscale {}x{} -> {}x{} ({:.2f} MP) for AI "
+                        "budget".format(w0, h0, proc_w, proc_h,
+                                        proc_w * proc_h / 1e6))
+                else:
+                    proc_img = image
+
+                sr = self._infer(proc_img)
+
+                # Resize SR output back to the original input size (we want
+                # AI cleanup at original size, not actual super-resolution).
+                if (sr.shape[1], sr.shape[0]) != (w0, h0):
+                    sr = cv2.resize(sr, (w0, h0),
                                     interpolation=cv2.INTER_LANCZOS4)
+
                 result.restored = sr
                 result.success = True
                 result.used_ai = True
                 result.elapsed_s = time.time() - t0
                 result.log.append(
-                    "  AI path: Real-ESRGAN x{} → output {}x{} ({:.2f}s)".format(
-                        self.scale, target_w, target_h, result.elapsed_s))
+                    "  AI path: Real-ESRGAN x{} -> output {}x{} ({:.2f}s)".format(
+                        self.scale, w0, h0, result.elapsed_s))
                 return result
             except Exception as e:
                 result.log.append("  [WARN] AI path failed: {}".format(e))
@@ -210,17 +236,27 @@ class GeneralRestorer:
     # ── internals ────────────────────────────────────────────────────
 
     def _classical_fallback(self, image: np.ndarray) -> np.ndarray:
-        """Conservative bilateral + unsharp + mild CLAHE — no AI."""
-        out = cv2.bilateralFilter(image, d=5, sigmaColor=35, sigmaSpace=8)
-        blur = cv2.GaussianBlur(out, (0, 0), sigmaX=1.0)
-        out = cv2.addWeighted(out, 1.25, blur, -0.25, 0)
+        """
+        Three-stage classical pipeline (bilateral denoise -> CLAHE on
+        L channel -> unsharp mask) tuned to be visibly better than the
+        input on degraded photos but still safe on clean ones.
 
-        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
+        Quality Guard will catch any over-processing downstream; this
+        function is intentionally a bit assertive so the user actually
+        sees an improvement when the AI path is unavailable.
+        """
+        denoise = cv2.bilateralFilter(image, d=7, sigmaColor=40, sigmaSpace=10)
+
+        lab = cv2.cvtColor(denoise, cv2.COLOR_BGR2LAB)
         L, A, B = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         L = clahe.apply(L)
-        out = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
-        return np.clip(out, 0, 255).astype(np.uint8)
+        contrasted = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
+
+        blur = cv2.GaussianBlur(contrasted, (0, 0), sigmaX=1.2)
+        sharpened = cv2.addWeighted(contrasted, 1.5, blur, -0.5, 0)
+
+        return np.clip(sharpened, 0, 255).astype(np.uint8)
 
     def _infer(self, image_bgr: np.ndarray) -> np.ndarray:
         """Tile-aware inference. Returns BGR uint8, scale × spatial size."""

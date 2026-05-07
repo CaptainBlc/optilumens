@@ -84,7 +84,11 @@ class EngineThresholds:
     noise_high:       float = 12.0    # above this trigger Real-ESRGAN
     skin_face_min:    float = 0.04    # below this assume no face
     low_res_mp:       float = 1.5     # below this prefer Real-ESRGAN x2
-    high_res_mp:      float = 12.0    # above this skip Real-ESRGAN (cost)
+    # Real-ESRGAN now downsamples before AI when input is huge, so we
+    # don't need a hard upper bound any more. 50 MP is a safety net for
+    # absurd cases (RAW photos, scans, etc) where even downsampling is
+    # not worth the wait.
+    high_res_mp:      float = 50.0
 
 
 class DecisionEngine:
@@ -153,29 +157,32 @@ class DecisionEngine:
                     profile.skin_ratio, thr.skin_face_min),
                 priority=10))
 
-        # ── Layer 2: Real-ESRGAN — general AI for non-face / low-res ──
+        # ── Layer 2: Real-ESRGAN — general AI cleanup ──
+        # GeneralRestorer does AI denoising + sharpening at the
+        # original size (any upscale is cancelled internally and the
+        # input is auto-downsampled if huge), so it's cheap enough to
+        # run on almost everything that isn't already pristine.
         run_general = False
         general_reason = ""
         if too_big_for_sr:
             general_reason = (
-                "image too large for super-resolution ({:.1f} MP > {:.1f} MP) — "
-                "skip to keep latency reasonable".format(mp, thr.high_res_mp))
-        elif not has_face and (low_res or very_blurry or very_noisy):
+                "image absurdly large ({:.1f} MP > {:.1f} MP) -- skip "
+                "to avoid extreme latency".format(mp, thr.high_res_mp))
+        elif profile.is_blurry or is_noisy or low_res:
             run_general = True
             general_reason = (
-                "non-face content needing AI lift  "
-                "(low_res={}, very_blurry={}, very_noisy={})".format(
-                    low_res, very_blurry, very_noisy))
-        elif has_face and (low_res or very_blurry):
+                "AI cleanup useful (blurry={}, noisy={}, low_res={})".format(
+                    profile.is_blurry, is_noisy, low_res))
+        elif profile.contrast < 0.18:
             run_general = True
             general_reason = (
-                "face present but global resolution/blur poor — Real-ESRGAN "
-                "fixes background that GFPGAN won't touch")
+                "low contrast ({:.2f}) -- Real-ESRGAN micro-detail recovery "
+                "helps".format(profile.contrast))
         else:
             general_reason = (
-                "image acceptable globally (mp={:.1f}, blur={:.0f}, "
-                "noise={:.1f}) — Real-ESRGAN unnecessary".format(
-                    mp, profile.blur_score, profile.noise_level))
+                "image already crisp + clean (blur={:.0f}, noise={:.1f}, "
+                "contrast={:.2f}) -- AI cleanup unnecessary".format(
+                    profile.blur_score, profile.noise_level, profile.contrast))
         plan.steps.append(Decision(
             Layer.REAL_ESRGAN, run_general, general_reason, priority=20))
 

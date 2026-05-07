@@ -299,7 +299,14 @@ class FaceRestorer:
             # Restore each face
             for i, face in enumerate(self._helper.cropped_faces):
                 restored = self._run_gfpgan(face)
-                self._helper.add_restored_face(restored, face)
+                # facexlib's `add_restored_face` signature changed across
+                # versions. New (>=0.3): only the restored face. Old: also
+                # the cropped input. Try the modern call first, fall back
+                # for older installs.
+                try:
+                    self._helper.add_restored_face(restored)
+                except TypeError:
+                    self._helper.add_restored_face(restored, face)
                 box = self._helper.det_faces[i] if i < len(
                     self._helper.det_faces) else []
                 result.face_bboxes.append(box)
@@ -374,18 +381,32 @@ class FaceRestorer:
         return _tensor_to_img(output)
 
     def _classical_fallback(self, img: np.ndarray) -> np.ndarray:
-        """Conservative CLAHE + mild sharpening (no GFPGAN model available).
-
-        Deliberately light-touch — main restoration is GFPGAN's job.
-        clipLimit=1.0 to avoid aggressive entropy change.
         """
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        Stronger-than-trivial classical pipeline used when GFPGAN's
+        AI path can't run. Three stages that each address a common
+        defect on real photos:
+
+            1. Edge-preserving denoise (bilateral) — removes low-level
+               sensor noise without smearing skin/edges.
+            2. CLAHE on the L channel — recovers shadow detail.
+            3. Unsharp mask — restores micro-contrast lost to denoise.
+
+        Tuned to be visibly better than the input on a typical phone
+        photo, but still safe on already-clean ones (Quality Guard
+        will downgrade or reject if the drift goes too high).
+        """
+        denoise = cv2.bilateralFilter(img, d=7, sigmaColor=40, sigmaSpace=10)
+
+        lab = cv2.cvtColor(denoise, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         l = clahe.apply(l)
-        enhanced = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-        blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
-        return cv2.addWeighted(enhanced, 1.2, blur, -0.2, 0)
+        contrasted = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        blur = cv2.GaussianBlur(contrasted, (0, 0), sigmaX=1.2)
+        sharpened = cv2.addWeighted(contrasted, 1.5, blur, -0.5, 0)
+
+        return np.clip(sharpened, 0, 255).astype(np.uint8)
 
     def _global_enhance(self, img: np.ndarray) -> np.ndarray:
         """Very light CLAHE when no face detected (no model available)."""
