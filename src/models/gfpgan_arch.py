@@ -20,19 +20,41 @@ from .stylegan2_clean import StyleGAN2GeneratorCSFT
 
 
 class ResBlock(nn.Module):
-    """Residual block for condition extraction."""
+    """
+    Residual block for condition extraction (matches original GFPGAN).
 
-    def __init__(self, in_channels, out_channels):
+    Two key behaviours we must reproduce to load `GFPGANv1.3.pth`:
+      1. conv1 keeps the channel count identical to the input width;
+         conv2 is the layer that performs the channel transition.
+         (The opposite ordering causes shape-mismatch on load.)
+      2. The block also rescales spatial resolution: encoder blocks
+         downsample by ½, decoder blocks upsample by 2. Without this,
+         the encoder feature map never reaches 4×4, and the linear
+         projection blows up to ~67 M elements.
+    """
+
+    def __init__(self, in_channels, out_channels, mode: str = "down"):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1)
-        self.skip = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        self.act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        assert mode in ("down", "up", "none"), \
+            "mode must be 'down', 'up', or 'none'"
+        self.scale_factor = {"down": 0.5, "up": 2.0, "none": 1.0}[mode]
+
+        self.conv1 = nn.Conv2d(in_channels, in_channels,  3, 1, 1)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
+        self.skip  = nn.Conv2d(in_channels, out_channels, 1, bias=False)
 
     def forward(self, x):
-        out = self.act(self.conv1(x))
-        out = self.act(self.conv2(out))
-        return out + self.skip(x)
+        out = F.leaky_relu_(self.conv1(x), negative_slope=0.2)
+        if self.scale_factor != 1.0:
+            out = F.interpolate(out, scale_factor=self.scale_factor,
+                                mode="bilinear", align_corners=False)
+        out = F.leaky_relu_(self.conv2(out), negative_slope=0.2)
+
+        x_skip = x
+        if self.scale_factor != 1.0:
+            x_skip = F.interpolate(x_skip, scale_factor=self.scale_factor,
+                                   mode="bilinear", align_corners=False)
+        return out + self.skip(x_skip)
 
 
 class GFPGANv1Clean(nn.Module):
@@ -97,7 +119,8 @@ class GFPGANv1Clean(nn.Module):
         self.conv_body_down = nn.ModuleList()
         for i in range(self.log_size, 2, -1):
             self.conv_body_down.append(
-                ResBlock(channels[str(2 ** i)], channels[str(2 ** (i - 1))]))
+                ResBlock(channels[str(2 ** i)], channels[str(2 ** (i - 1))],
+                         mode="down"))
 
         self.final_conv = nn.Conv2d(channels['4'], channels['4'], 3, 1, 1)
 
@@ -112,7 +135,8 @@ class GFPGANv1Clean(nn.Module):
         self.conv_body_up = nn.ModuleList()
         for i in range(3, self.log_size + 1):
             self.conv_body_up.append(
-                ResBlock(channels[str(2 ** (i - 1))], channels[str(2 ** i)]))
+                ResBlock(channels[str(2 ** (i - 1))], channels[str(2 ** i)],
+                         mode="up"))
 
         # ── SFT condition layers ─────────────────────────────────
         self.condition_scale = nn.ModuleList()
@@ -166,13 +190,12 @@ class GFPGANv1Clean(nn.Module):
                                          self.num_style_feat)
 
         # ── Decoder + SFT conditions ─────────────────────────────
+        # ResBlock(mode="up") already upsamples, so no extra interpolate.
+        dec = None
         for i in range(self.log_size - 2):
-            enc = unet_skips[i]
-            if i > 0:
-                enc = enc + dec
-            dec = self.conv_body_up[i](enc)
-            dec = F.interpolate(dec, scale_factor=2, mode='bilinear',
-                                align_corners=False)
+            enc_skip = unet_skips[i]
+            in_feat = enc_skip if dec is None else (enc_skip + dec)
+            dec = self.conv_body_up[i](in_feat)
 
             scale = self.condition_scale[i](dec)
             conditions.append(scale.clone())

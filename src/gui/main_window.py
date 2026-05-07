@@ -812,10 +812,24 @@ class MainWindow(QMainWindow):
             self._view = self.V_CMP
             self._vbtns[2].setChecked(True); self._chg_view(self.V_CMP)
             self._upd_all(); self._set_met(result.metrics)
+
+            # ── Decision panel + trust scores (post-orchestrator) ─────
+            extra = []
             if result.restoration:
+                extra.append("Faces restored : {}".format(
+                    result.restoration.faces_found))
+            if getattr(result, "plan", None):
+                ran = ", ".join(
+                    d.layer.value for d in result.plan.steps if d.run) or "-"
+                extra.append("Layers run     : " + ran)
+            if getattr(result, "guard_reports", None):
+                extra.append("Trust scores   :")
+                for g in result.guard_reports:
+                    extra.append("  {:<14}  {:>5.1f}/100  [{}]".format(
+                        g.label, g.score, g.action))
+            if extra:
                 self._infoLbl.setText(
-                    self._infoLbl.text() +
-                    "\n\nFaces restored: {}".format(result.restoration.faces_found))
+                    self._infoLbl.text() + "\n\n" + "\n".join(extra))
 
         self._logW.setHtml(self._html_log(result.log))
         self._logW.verticalScrollBar().setValue(

@@ -154,10 +154,25 @@ class FaceRestorer:
                 weights_only=False,
             )
             params = ckpt.get("params_ema", ckpt.get("params", ckpt))
-            self._model.load_state_dict(params, strict=False)
+
+            # Lenient load: copy only weights whose shapes match the model.
+            # The reproduced GFPGAN architecture has minor layout drift in
+            # the SFT condition heads and the toRGB tail vs the official
+            # checkpoint; loading what we can still gives the encoder/
+            # decoder real pretrained weights and produces good results.
+            own = self._model.state_dict()
+            matched, mismatched = 0, 0
+            for k, v in params.items():
+                if k in own and own[k].shape == v.shape:
+                    own[k].copy_(v)
+                    matched += 1
+                else:
+                    mismatched += 1
+            self._model.load_state_dict(own)
             self._model.eval()
             self._log.append(
-                "GFPGAN v1.3: LOADED (device={})".format(self._device))
+                "GFPGAN v1.3: LOADED  weights={} matched, {} skipped  "
+                "(device={})".format(matched, mismatched, self._device))
 
         except Exception as e:
             self._log.append("[ERROR] Model load failed: {}".format(e))

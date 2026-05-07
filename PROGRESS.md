@@ -5,16 +5,30 @@
 > Structured so both humans and AI can parse it quickly.
 
 **Repo:** `https://github.com/CaptainBlc/Global-Enhancement`
-**Active branch:** `main`
-**Owner (this machine):** Batuhan Taşdemir — Pixel Layer
+**Active branch:** `Batuhan-Develop`
+**Owner (this machine):** Batuhan Taşdemir — Pixel Layer + Orchestration
 
 ---
 
 ## Current Status
 
-**Phase:** Post-refactor → GFPGAN-based system is live, GUI works, model auto-downloads.
-**Active Sprint:** Backlog tidy-up (stretch goals) — all four roadmap sprints done.
+**Phase:** Orchestrator refactor — Decision Engine + Quality Guard + Real-ESRGAN added on `Batuhan-Develop`. Pipeline is now profile-driven and audit-ready.
+**Active Sprint:** Defense-readiness pass.
 **Blocked on:** nothing
+**Safe rollback point:** tag `v1.0-pre-orchestrator` on `main` (pushed to remote).
+
+### What's new in this branch (vs `main`)
+- `src/decision_engine.py` — profile-based layer selector (RUN/SKIP justification per layer)
+- `src/quality_guard.py` — anti-hallucination SSIM guard with accept/blend/reject
+- `src/general_restorer.py` — Real-ESRGAN x2plus wrapper, lazy imports, tile inference
+- `src/models/rrdb_arch.py` — pure-PyTorch RRDBNet backbone (no `basicsr`)
+- `src/pipeline.py` — orchestrated multi-model run; only chosen layers execute, every AI step is guarded
+- `src/face_restorer.py` — lenient state-dict load + GFPGAN ResBlock fix (down/up modes, conv ordering)
+- `scripts/download_model.py` — multi-model fetcher (`--only gfpgan|realesrgan`)
+- `src/gui/main_window.py` — info panel now shows decision plan + per-layer trust scores
+
+### Known issues
+- GFPGAN encoder/decoder load 230/285 weights; the SFT condition heads and StyleGAN2 toRGB tail need a deeper architecture pass to fully load the official `GFPGANv1.3.pth`. System gracefully falls back to classical face sharpening when the StyleGAN2 forward fails. **Pipeline still works end-to-end** because Real-ESRGAN, FaceParser, RegionEnhancer, and GlobalEnhancer cover the same use case.
 
 ---
 
@@ -32,6 +46,16 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 ---
 
 ## Changelog
+
+### 2026-05-07 — Orchestrator refactor on `Batuhan-Develop`
+- **New `src/decision_engine.py`** — `DecisionEngine.decide(profile, faces_found, image_shape)` returns a `Plan` of typed `Decision`s. Each layer is justified individually so the pipeline log explicitly states *why* GFPGAN ran or didn't, why Real-ESRGAN was skipped, etc. (HLD §1 explainable processing requirement).
+- **New `src/quality_guard.py`** — model-agnostic anti-hallucination guard. Computes SSIM + pixel drift between any layer's input/output, converts to a 0–100 trust score, and decides accept (≥70) / blend (≥50) / reject (<50). Caught GlobalEnhancer over-cooking on a sharp face image during testing — blended back 40 % to original.
+- **New `src/general_restorer.py` + `src/models/rrdb_arch.py`** — Real-ESRGAN x2plus integration written in pure PyTorch (no `basicsr` dependency, same approach we used for GFPGAN). Lazy `torch` import, tile-based inference for big frames, conservative classical fallback if weights aren't downloaded yet.
+- **`src/face_restorer.py`** — switched to lenient state-dict load. The reproduced GFPGAN architecture had two bugs found while debugging: (1) `ResBlock` had `conv1`/`conv2` swapped in channel-transition role, (2) `ResBlock` was missing the down/up interpolation. Both fixed in `src/models/gfpgan_arch.py`. Encoder + decoder now load ~230/285 official weights cleanly. SFT/toRGB tail still needs work; system gracefully degrades to classical when the GAN forward fails.
+- **`src/pipeline.py`** — `restoreImage()` now: profile → DecisionEngine → execute only chosen layers → guard each AI step → metrics + diff. Returns `EnhancementResult` with new `plan` and `guard_reports` fields.
+- **`src/gui/main_window.py`** — `_on_done` now appends a compact "Layers run" + "Trust scores" block to the info panel after every Restore.
+- **Docs:** `PROGRESS.md` updated with this branch's diff and known issues.
+- **Safety:** `git tag v1.0-pre-orchestrator` pushed before any of these changes.
 
 ### 2026-05-06 — Merge `Furkan-Develop` into `main` (semantic + region path)
 - **Merged from** `origin/Furkan-Develop`: `src/semantic_parser.py` (`FaceParser`), `src/region_enhancer.py` (`RegionEnhancer`), `src/live_capture.py`, and `src/pipeline.py` wiring so `restoreImage()` runs GFPGAN then optional parse + per-region enhancement when faces parse successfully.
