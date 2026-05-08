@@ -52,6 +52,8 @@ class GuardReport:
     action:      str   = "accept"   # "accept" | "blend" | "reject"
     ssim:        float = 1.0
     pixel_drift: float = 0.0        # mean |delta| / 255
+    delta_e:     float = 0.0        # mean LAB ΔE (proxy)
+    sat_shift:   float = 0.0        # mean ΔS / 255 (HSV)
     output:      Optional[np.ndarray] = None
     log:         List[str] = field(default_factory=list)
 
@@ -111,6 +113,41 @@ def _to_gray(bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
 
+def _downscale(img: np.ndarray, max_side: int = 256) -> np.ndarray:
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_side:
+        return img
+    s = max_side / float(m)
+    return cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+
+
+def _mean_delta_e_cie76(a_bgr: np.ndarray, b_bgr: np.ndarray) -> float:
+    """Fast perceptual colour difference proxy (CIE76) on downscaled LAB."""
+    a = _downscale(a_bgr, 256)
+    b = _downscale(b_bgr, 256)
+    if a.shape[:2] != b.shape[:2]:
+        b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+    lab_a = cv2.cvtColor(a, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_b = cv2.cvtColor(b, cv2.COLOR_BGR2LAB).astype(np.float32)
+    d = lab_a - lab_b
+    de = np.sqrt(np.sum(d * d, axis=2))
+    return float(de.mean())
+
+
+def _mean_sat_shift(a_bgr: np.ndarray, b_bgr: np.ndarray) -> float:
+    """Mean saturation change in HSV (0..255 scale)."""
+    a = _downscale(a_bgr, 256)
+    b = _downscale(b_bgr, 256)
+    if a.shape[:2] != b.shape[:2]:
+        b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+    hsv_a = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
+    hsv_b = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+    Sa = hsv_a[:, :, 1].astype(np.float32)
+    Sb = hsv_b[:, :, 1].astype(np.float32)
+    return float(np.mean(np.abs(Sb - Sa)))
+
+
 # ── Guard ────────────────────────────────────────────────────────────
 
 class QualityGuard:
@@ -168,15 +205,25 @@ class QualityGuard:
         ssim = _ssim_gray(_to_gray(before), _to_gray(after_cmp))
         drift = float(np.mean(np.abs(
             after_cmp.astype(np.int16) - before.astype(np.int16)))) / 255.0
+        delta_e = _mean_delta_e_cie76(before, after_cmp)
+        sat_shift = _mean_sat_shift(before, after_cmp)
 
-        # Trust score: SSIM is structural, drift catches color/tone shifts
-        # that SSIM (luminance-only) misses. The previous 0.85/0.15 weights
-        # let aggressive global passes through with drift ~0.16 because
-        # SSIM stayed high; that produced visible purple/lavender washes.
-        # The 0.6/0.4 split with a 5x drift slope penalises colour swings
-        # without hurting genuinely useful enhancements (drift < 0.06).
+        # Trust score: structural + colour safety.
+        # - SSIM is structure (luma)
+        # - drift catches overall pixel movement
+        # - ΔE catches perceptual colour shifts (purple/green casts)
+        # - sat_shift catches saturation overshoot
         ssim01 = max(0.0, min(1.0, ssim))
-        score = 100.0 * (0.6 * ssim01 + 0.4 * (1.0 - min(1.0, drift * 5.0)))
+        drift_pen = 1.0 - min(1.0, drift * 5.0)
+        # ΔE roughly: <3 barely visible, 5-10 noticeable, >15 strong cast.
+        de_pen = 1.0 - min(1.0, max(0.0, (delta_e - 3.0) / 12.0))
+        sat_pen = 1.0 - min(1.0, sat_shift / 90.0)
+        score = 100.0 * (
+            0.50 * ssim01 +
+            0.25 * drift_pen +
+            0.15 * de_pen +
+            0.10 * sat_pen
+        )
 
         # Hard cap: catastrophic colour drift is always at least a BLEND.
         # A single channel shifting 18% on average is the kind of damage
@@ -188,14 +235,16 @@ class QualityGuard:
 
         rep.ssim = float(ssim01)
         rep.pixel_drift = drift
+        rep.delta_e = float(delta_e)
+        rep.sat_shift = float(sat_shift)
         rep.score = score
 
         if score >= self.accept:
             rep.action = "accept"
             rep.output = after
             rep.log.append(
-                "[GUARD/{}] ACCEPT  trust={:.1f}  ssim={:.3f}  drift={:.3f}".format(
-                    label, score, ssim01, drift))
+                "[GUARD/{}] ACCEPT  trust={:.1f}  ssim={:.3f}  drift={:.3f}  ΔE={:.1f}  ΔS={:.0f}".format(
+                    label, score, ssim01, drift, delta_e, sat_shift))
         elif score >= self.warn:
             # Blend: pull AI output toward original
             blended = cv2.addWeighted(
@@ -203,15 +252,15 @@ class QualityGuard:
             rep.action = "blend"
             rep.output = blended
             rep.log.append(
-                "[GUARD/{}] BLEND   trust={:.1f}  ssim={:.3f}  drift={:.3f}  "
+                "[GUARD/{}] BLEND   trust={:.1f}  ssim={:.3f}  drift={:.3f}  ΔE={:.1f}  ΔS={:.0f}  "
                 "(mix={:.0f}% original)".format(
-                    label, score, ssim01, drift, self.blend * 100))
+                    label, score, ssim01, drift, delta_e, sat_shift, self.blend * 100))
         else:
             rep.action = "reject"
             rep.output = before
             rep.log.append(
-                "[GUARD/{}] REJECT  trust={:.1f}  ssim={:.3f}  drift={:.3f}  "
+                "[GUARD/{}] REJECT  trust={:.1f}  ssim={:.3f}  drift={:.3f}  ΔE={:.1f}  ΔS={:.0f}  "
                 "— possible hallucination, keeping original".format(
-                    label, score, ssim01, drift))
+                    label, score, ssim01, drift, delta_e, sat_shift))
 
         return rep

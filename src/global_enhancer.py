@@ -32,14 +32,16 @@ import numpy as np
 @dataclass
 class GlobalEnhancerConfig:
     """Intensity knobs — 0.0 = off, 1.0 = maximum effect."""
-    white_balance:   float = 0.80
-    shadow_lift:     float = 0.75
-    denoise:         float = 0.55
-    clahe_strength:  float = 0.75
-    hdr_tone:        float = 0.65
-    sharpen:         float = 0.70
-    vibrance:        float = 0.60
-    film_look:       float = 0.55
+    # Default is intentionally MILD. Strong looks should come from presets
+    # (scene_presets.py) or live filter sliders, not from implicit defaults.
+    white_balance:   float = 0.45
+    shadow_lift:     float = 0.35
+    denoise:         float = 0.35
+    clahe_strength:  float = 0.35
+    hdr_tone:        float = 0.28
+    sharpen:         float = 0.35
+    vibrance:        float = 0.30
+    film_look:       float = 0.15
     temporal_frames: int   = 3
 
 

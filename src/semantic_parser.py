@@ -167,6 +167,38 @@ class FaceParser:
 
     # ── lazy init ─────────────────────────────────────────────────────
 
+    def _init_detector(self) -> bool:
+        """Init only the face detector helper (RetinaFace), without BiSeNet.
+
+        Used by the pipeline to get a reliable faces_found count for decisions,
+        especially in backlit webcam captures where skin_ratio can be misleading.
+        """
+        if self._helper is not None:
+            return True
+        if not _TORCH_AVAILABLE:
+            self._log.append("[ERROR] PyTorch not available")
+            return False
+        if not _check_facexlib():
+            self._log.append("[ERROR] facexlib not available")
+            return False
+        try:
+            from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+            self._helper = FaceRestoreHelper(
+                upscale_factor=1,
+                face_size=self.FACE_SIZE,
+                crop_ratio=(1, 1),
+                det_model="retinaface_resnet50",
+                save_ext="png",
+                use_parse=False,
+                device=self._device,
+            )
+            self._log.append("FaceParser: detector READY (RetinaFace)")
+            return True
+        except Exception as e:
+            self._log.append("[ERROR] Detector init failed: {}".format(e))
+            self._helper = None
+            return False
+
     def _init_model(self) -> bool:
         if self._model is not None:
             return True
@@ -175,6 +207,9 @@ class FaceParser:
             return False
         if not _check_facexlib():
             self._log.append("[ERROR] facexlib not available")
+            return False
+
+        if not self._init_detector():
             return False
 
         try:
@@ -191,26 +226,25 @@ class FaceParser:
             self._model = None
             return False
 
-        try:
-            from facexlib.utils.face_restoration_helper import FaceRestoreHelper
-            self._helper = FaceRestoreHelper(
-                upscale_factor=1,
-                face_size=self.FACE_SIZE,
-                crop_ratio=(1, 1),
-                det_model="retinaface_resnet50",
-                save_ext="png",
-                use_parse=False,             # we call BiSeNet ourselves
-                device=self._device,
-            )
-            self._log.append("FaceParser: detector READY (RetinaFace)")
-        except Exception as e:
-            self._log.append("[ERROR] Detector init failed: {}".format(e))
-            self._helper = None
-            return False
-
         return True
 
     # ── Public API ────────────────────────────────────────────────────
+
+    def detect_faces_count(self, img: np.ndarray) -> int:
+        """Return detected face count using RetinaFace only (fast path)."""
+        self._log = []
+        if img is None or img.size == 0:
+            return 0
+        if not self._init_detector():
+            return 0
+        try:
+            self._helper.clean_all()
+            self._helper.read_image(img)
+            self._helper.get_face_landmarks_5(eye_dist_threshold=5)
+            self._helper.align_warp_face()
+            return int(len(self._helper.cropped_faces))
+        except Exception:
+            return 0
 
     def parse(self, img: np.ndarray) -> SemanticResult:
         """

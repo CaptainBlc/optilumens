@@ -47,6 +47,12 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 
 ## Changelog
 
+### 2026-05-08 — Live quality pass (feat branch): stronger but highlight-safe
+- **Live filters strengthened (still safe):** `src/live_filters.py`
+  - **BEAUTY** default effect increased on midtones (contrast/sharpness/vibrance), while preserving **midtone-only blending** + **backlit highlight suppression** to prevent halos/posterization on curtains/windows.
+  - **ENHANCE** intensity mapping slightly increased for clean frames (still auto-reduced on overexposed / low-light / noisy / blurry scenes) to get a more “phone-like” punch without breaking highlights.
+- **Context:** driven by backlit artifact reports from live preview screenshots.
+
 ### 2026-05-07 — Orchestrator refactor on `Batuhan-Develop`
 - **New `src/decision_engine.py`** — `DecisionEngine.decide(profile, faces_found, image_shape)` returns a `Plan` of typed `Decision`s. Each layer is justified individually so the pipeline log explicitly states *why* GFPGAN ran or didn't, why Real-ESRGAN was skipped, etc. (HLD §1 explainable processing requirement).
 - **New `src/quality_guard.py`** — model-agnostic anti-hallucination guard. Computes SSIM + pixel drift between any layer's input/output, converts to a 0–100 trust score, and decides accept (≥70) / blend (≥50) / reject (<50). Caught GlobalEnhancer over-cooking on a sharp face image during testing — blended back 40 % to original.

@@ -78,7 +78,9 @@ class Plan:
 @dataclass
 class EngineThresholds:
     """All numeric thresholds gathered in one place for auditability."""
-    blur_sharp:       float = 250.0   # >= this is considered already sharp
+    # Webcam blur_score is lower than "photo" blur_score; keep this threshold
+    # conservative so we don't run GFPGAN on already-OK faces.
+    blur_sharp:       float = 110.0   # >= this is considered already sharp
     blur_acceptable:  float = 60.0    # below this we definitely run AI
     noise_clean:      float = 4.0     # below this skip denoising
     noise_high:       float = 12.0    # above this trigger Real-ESRGAN
@@ -221,6 +223,10 @@ class DecisionEngine:
         )
         if pn in ("wow", "magazine", "vivid"):
             run_cosmetic = has_face and (not profile.is_overexposed)
+        elif pn in ("natural_plus", "portrait"):
+            # Product behavior: even clean frames should get a mild, phone-like
+            # cosmetic polish (scaled elsewhere by auto-strength).
+            run_cosmetic = has_face and (not profile.is_overexposed)
         else:
             run_cosmetic = has_face and (not looks_fine)
 
@@ -257,11 +263,34 @@ class DecisionEngine:
                 "image already overexposed (brightness={:.2f}) -- global stack "
                 "would push tones further; skip to keep fidelity".format(
                     profile.brightness))
+        elif looks_fine and pn in ("wow", "magazine", "vivid"):
+            # WOW aims for visible changes, but global tone-mapping is the #1 source
+            # of "plasticky / broken" look on webcam captures. For clean frames,
+            # prefer cosmetics-only (face parse + region) and keep global off unless
+            # contrast/brightness actually demand it.
+            b = float(getattr(profile, "brightness", 0.50))
+            c = float(getattr(profile, "contrast", 0.25))
+            if (0.45 <= b <= 0.65) and (c >= 0.22):
+                run_global = False
+                global_reason = (
+                    "clean frame under '{}' (brightness={:.2f}, contrast={:.2f}) "
+                    "-- skip global to avoid tone/colour artifacts; cosmetics-only".format(
+                        pn, b, c))
+            else:
+                run_global = True
+                global_reason = (
+                    "image needs global help (brightness/contrast not ideal) "
+                    "under '{}'".format(pn))
         elif looks_fine and pn not in ("wow", "magazine", "vivid"):
-            run_global = False
-            global_reason = (
-                "image already well-balanced (bright/contrast/noise/blur all OK) "
-                "-- skipping global pass to avoid over-processing")
+            if pn in ("natural_plus", "portrait"):
+                run_global = True
+                global_reason = (
+                    "clean frame under '{}' -- apply mild phone-like polish".format(pn))
+            else:
+                run_global = False
+                global_reason = (
+                    "image already well-balanced (bright/contrast/noise/blur all OK) "
+                    "-- skipping global pass to avoid over-processing")
         else:
             run_global = True
             global_reason = (

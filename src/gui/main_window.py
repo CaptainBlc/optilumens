@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QButtonGroup, QDialog, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
 )
-from PyQt6.QtCore import Qt, QRect, QPoint, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QPoint, QThread, QTimer, pyqtSignal, QEvent
 from PyQt6.QtGui import (
     QPixmap, QImage, QAction, QKeySequence,
     QPainter, QPen, QColor, QFont, QBrush, QRegion,
@@ -425,8 +425,8 @@ class MainWindow(QMainWindow):
         self._worker = None
         # Active scene preset (set by chat: "fix this old photo",
         # "make it look professional", etc.). None means use slider only.
-        # Default: a safe "phone-like" natural enhancement.
-        self._active_preset = PRESETS.get("natural_plus")
+        # Default: automatic — pipeline selects the best preset per photo.
+        self._active_preset = None
         self._lastResult = None
 
         # Live camera state (Analysis Report Scenario 4)
@@ -445,6 +445,10 @@ class MainWindow(QMainWindow):
         self._fps_last_ts: float = 0.0
         self._filter_ms_ema: float = 0.0
         self._cam_devices = []     # last enumeration result
+        # Live compare (swipe bar) state: show original vs filtered in one view.
+        self._live_swipe_on: bool = False
+        self._live_swipe_ratio: float = 0.50
+        self._live_swipe_drag: bool = False
 
         self._build_menu()
         self._build_ui()
@@ -531,6 +535,13 @@ class MainWindow(QMainWindow):
             self._fgrp.addButton(b, i); self._fbtns.append(b); tl.addWidget(b)
         self._fgrp.idClicked.connect(self._set_filter)
 
+        # Live "difference" swipe bar (original vs filtered). Hidden unless live is ON.
+        self._ckLiveDiff = QCheckBox("Diff")
+        self._ckLiveDiff.setVisible(False)
+        self._ckLiveDiff.setToolTip("Show original vs filter with a swipe bar")
+        self._ckLiveDiff.stateChanged.connect(self._toggle_live_diff)
+        tl.addWidget(self._ckLiveDiff)
+
         # Live filter parameters (Beauty smoothness / warmth, Enhance intensity).
         # Hidden by default; revealed when an applicable filter is active.
         self._sldSmooth = QSlider(Qt.Orientation.Horizontal)
@@ -548,7 +559,8 @@ class MainWindow(QMainWindow):
         tl.addWidget(self._sldWarm)
 
         self._sldInt = QSlider(Qt.Orientation.Horizontal)
-        self._sldInt.setRange(0, 100); self._sldInt.setValue(100)
+        # Allow slight "boost" beyond 100% for presentation (handled by filter caps).
+        self._sldInt.setRange(0, 130); self._sldInt.setValue(110)
         self._sldInt.setFixedWidth(80); self._sldInt.setVisible(False)
         self._sldInt.setToolTip("Filter intensity (Enhance)")
         self._sldInt.valueChanged.connect(self._on_filter_param)
@@ -576,6 +588,9 @@ class MainWindow(QMainWindow):
         vw = QWidget(); vl = QVBoxLayout(vw)
         vl.setContentsMargins(4, 4, 2, 2); vl.setSpacing(0)
         self._vpS = Viewport("Open an image or drag & drop here")
+        # Mouse events for the live swipe bar (Diff checkbox).
+        self._vpS.setMouseTracking(True)
+        self._vpS.installEventFilter(self)
         self._vpC = SwipeWidget(); self._vpC.hide()
         vl.addWidget(self._vpS); vl.addWidget(self._vpC)
         hsp.addWidget(vw)
@@ -1023,9 +1038,13 @@ class MainWindow(QMainWindow):
         self._camPick.currentIndexChanged.connect(self._switch_camera)
 
         chosen = cams[0].index
-        # Live preview is CPU-bound when filters are enabled; 960x540 keeps the
-        # UI responsive while still looking sharp on a typical laptop display.
-        if not self._cam.open(chosen, width=960, height=540):
+        # Try higher camera resolutions first (better IQ), then fall back.
+        opened = (
+            self._cam.open(chosen, width=1280, height=720) or
+            self._cam.open(chosen, width=960, height=540) or
+            self._cam.open(chosen, width=None, height=None)
+        )
+        if not opened:
             self._bLive.setChecked(False)
             self._logW.setHtml(self._html_log([
                 "[ERROR] Failed to open camera at index {}".format(chosen),
@@ -1041,6 +1060,7 @@ class MainWindow(QMainWindow):
         self._bShot.setVisible(True)
         self._filterLbl.setVisible(True)
         for b in self._fbtns: b.setVisible(True)
+        self._ckLiveDiff.setVisible(True)
         self._bLoad.setEnabled(False); self._bRest.setEnabled(False)
         self._bRset.setEnabled(False)
 
@@ -1049,6 +1069,7 @@ class MainWindow(QMainWindow):
 
         self._update_filter_panel_visibility()
         self._refresh_info_panel()
+        self._live_swipe_on = bool(self._ckLiveDiff.isChecked())
 
         self._logW.setHtml(self._html_log([
             "=== Live Camera Mode ===",
@@ -1069,7 +1090,12 @@ class MainWindow(QMainWindow):
         was_running = self._cam_timer.isActive()
         self._cam_timer.stop()
         self._cam.close()
-        if not self._cam.open(target, width=960, height=540):
+        opened = (
+            self._cam.open(target, width=1280, height=720) or
+            self._cam.open(target, width=960, height=540) or
+            self._cam.open(target, width=None, height=None)
+        )
+        if not opened:
             self._logW.setHtml(self._html_log([
                 "[WARN] Could not switch to camera index {}".format(target),
             ]))
@@ -1088,6 +1114,10 @@ class MainWindow(QMainWindow):
         self._filterLbl.setVisible(False)
         self._camPick.setVisible(False)
         for b in self._fbtns: b.setVisible(False)
+        self._ckLiveDiff.setVisible(False)
+        self._ckLiveDiff.setChecked(False)
+        self._live_swipe_on = False
+        self._live_swipe_drag = False
         self._sldSmooth.setVisible(False)
         self._sldWarm.setVisible(False)
         self._sldInt.setVisible(False)
@@ -1129,6 +1159,10 @@ class MainWindow(QMainWindow):
                                if self._filter_ms_ema else filt_ms)
 
         self._cam_frame = frame  # raw frame -- snapshot uses this
+        # Optional: original-vs-filter swipe compare in live mode.
+        if self._live_swipe_on and self._filter_name != "OFF":
+            display = self._compose_live_swipe(frame, display, self._live_swipe_ratio)
+
         display = self._draw_overlay(display)
 
         # NOTE (performance): In live mode, converting full-res frames to two
@@ -1157,6 +1191,64 @@ class MainWindow(QMainWindow):
             disp_small = display
 
         self._vpS.img(self._pm(disp_small))
+
+    def _toggle_live_diff(self, _state: int) -> None:
+        self._live_swipe_on = bool(self._ckLiveDiff.isChecked())
+        self._live_swipe_drag = False
+        if self._live_swipe_on:
+            self._vpS.setCursor(Qt.CursorShape.SplitHCursor)
+        else:
+            self._vpS.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _compose_live_swipe(self, orig: np.ndarray, filt: np.ndarray, ratio: float) -> np.ndarray:
+        """Return a split view: left=orig, right=filt, with a draggable bar."""
+        try:
+            if orig is None or filt is None or orig.size == 0 or filt.size == 0:
+                return filt if filt is not None else orig
+            if orig.shape != filt.shape:
+                return filt
+            h, w = orig.shape[:2]
+            r = float(max(0.02, min(0.98, ratio)))
+            x = int(w * r)
+            out = orig.copy()
+            out[:, x:] = filt[:, x:]
+
+            # Bar line + knob (phone-like compare UI).
+            bar_col = (48, 48, 200)   # BGR close to accent red
+            cv2.line(out, (x, 0), (x, h - 1), bar_col, 2, cv2.LINE_AA)
+            cy = h // 2
+            cv2.circle(out, (x, cy), 10, bar_col, -1, cv2.LINE_AA)
+            cv2.circle(out, (x, cy), 10, (240, 240, 240), 1, cv2.LINE_AA)
+            cv2.line(out, (x - 4, cy), (x - 1, cy - 3), (240, 240, 240), 2, cv2.LINE_AA)
+            cv2.line(out, (x - 4, cy), (x - 1, cy + 3), (240, 240, 240), 2, cv2.LINE_AA)
+            cv2.line(out, (x + 4, cy), (x + 1, cy - 3), (240, 240, 240), 2, cv2.LINE_AA)
+            cv2.line(out, (x + 4, cy), (x + 1, cy + 3), (240, 240, 240), 2, cv2.LINE_AA)
+            return out
+        except Exception:
+            return filt
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
+        # Handle the live swipe bar drag on the preview viewport.
+        try:
+            if obj is self._vpS and self._view == self.V_LIVE and self._live_swipe_on:
+                et = event.type()
+                if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                    self._live_swipe_drag = True
+                    x = float(event.position().x())
+                    w = float(max(1, self._vpS.width()))
+                    self._live_swipe_ratio = max(0.02, min(0.98, x / w))
+                    return True
+                if et == QEvent.Type.MouseMove:
+                    if self._live_swipe_drag:
+                        x = float(event.position().x())
+                        w = float(max(1, self._vpS.width()))
+                        self._live_swipe_ratio = max(0.02, min(0.98, x / w))
+                        return True
+                if et == QEvent.Type.MouseButtonRelease:
+                    self._live_swipe_drag = False
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def _draw_overlay(self, img: np.ndarray) -> np.ndarray:
         """Render an FPS/filter HUD on the live preview frame."""
@@ -1244,46 +1336,14 @@ class MainWindow(QMainWindow):
             self._logW.setHtml(self._html_log(["[ERROR] Snapshot failed"]))
             return
 
-        # Performance: live cameras often deliver 720p/1080p; running the full
-        # pipeline on that resolution on CPU (especially Real-ESRGAN) is slow.
-        # Downscale the snapshot to a sane max side for interactive demos.
-        try:
-            h0, w0 = snap.shape[:2]
-            max_side = max(h0, w0)
-            target = 480  # keeps face models effective; much faster for ESRGAN/parse
-            if max_side > target:
-                s = target / max_side
-                snap = cv2.resize(
-                    snap,
-                    (max(1, int(w0 * s)), max(1, int(h0 * s))),
-                    interpolation=cv2.INTER_AREA,
-                )
-        except Exception:
-            pass
-
-        # If a live filter is active, the user probably wants its look
-        # preserved in the snapshot. Apply it once to the stabilised frame.
+        # IMPORTANT (quality): do NOT bake the live preview filter into the snapshot.
+        # The full pipeline (Region/Global/GFPGAN) will run on the captured frame,
+        # and applying a live filter first causes "double-processing" artifacts.
         filter_used = self._filter_name
-        if filter_used != "OFF":
-            try:
-                f = self._filter.apply(snap)
-                if f is not None:
-                    snap = f
-            except Exception:
-                pass
 
         self._cam_timer.stop()
         self._bLive.setChecked(False)
         self._stop_live()
-
-        # Live snapshots should look "wow" by default for presentation, even when the
-        # DecisionEngine thinks the frame is already clean. Use the WOW preset for
-        # captured live frames unless the user already picked something else.
-        try:
-            if getattr(self, "_active_preset", None) is None or getattr(self._active_preset, "name", "") in ("natural_plus", "modern_touch"):
-                self._active_preset = PRESETS.get("wow") or self._active_preset
-        except Exception:
-            pass
 
         # Feed snapshot as if it were a loaded image
         self._orig = snap

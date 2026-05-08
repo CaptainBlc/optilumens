@@ -86,9 +86,9 @@ class BeautyFilter(BaseFilter):
     is_ready = True
 
     def __init__(self,
-                 smooth_strength: float = 0.78,
-                 clarity: float = 0.78,
-                 warmth: float = 0.40) -> None:
+                 smooth_strength: float = 0.72,
+                 clarity: float = 0.68,
+                 warmth: float = 0.38) -> None:
         self.smooth  = float(np.clip(smooth_strength, 0.0, 1.0))
         self.clarity = float(np.clip(clarity, 0.0, 1.0))
         self.warmth  = float(np.clip(warmth, 0.0, 1.0))
@@ -96,9 +96,11 @@ class BeautyFilter(BaseFilter):
         self._frame_cnt = 0
         self._profiler = None
         self._profile = None
-        # A bit stronger than the demo defaults; still conservative enough
-        # to avoid harsh halos on low-quality webcams.
-        self._clahe = cv2.createCLAHE(clipLimit=3.4, tileGridSize=(8, 8))
+        # Process BEAUTY at a smaller resolution for live FPS, then upscale and blend.
+        self._proc_max = 640
+        # Default CLAHE is intentionally mild; aggressive CLAHE amplifies noise
+        # on low-quality webcams (exact issue in the screenshots).
+        self._clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
 
     def set_params(self, **kwargs) -> None:
         """Live-tune Beauty knobs from a slider panel.
@@ -126,10 +128,57 @@ class BeautyFilter(BaseFilter):
         except Exception:
             self._profiler = None
 
+    @staticmethod
+    def _highlight_ratio(frame: np.ndarray) -> float:
+        """Fraction of very bright pixels (backlit detection)."""
+        try:
+            small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA)
+            g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            return float(np.mean(g >= 245))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _midtone_mask(frame: np.ndarray) -> np.ndarray:
+        """Float32 mask [0..1] — apply enhancement mostly on midtones."""
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        m = ((g >= 25) & (g <= 230)).astype(np.float32)
+        return cv2.GaussianBlur(m, (0, 0), 3.0)
+
+    @staticmethod
+    def _skin_mask(frame: np.ndarray) -> np.ndarray:
+        """Float32 mask [0..1] — cheap skin proxy for face/hand emphasis."""
+        try:
+            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            _, cr, cb = cv2.split(ycrcb)
+            # Classic YCrCb skin box; tuned a bit wider for webcams.
+            m = ((cr >= 135) & (cr <= 180) & (cb >= 85) & (cb <= 135)).astype(np.uint8) * 255
+            # Fill small holes / remove speckles -> avoids patchy artifacts.
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)
+            m = cv2.GaussianBlur(m, (0, 0), 7.0)
+            return (m.astype(np.float32) / 255.0)
+        except Exception:
+            return np.ones(frame.shape[:2], dtype=np.float32)
+
     def apply(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or frame.size == 0:
             return frame
         out = frame
+
+        # Downscale for processing if needed (keep display resolution intact).
+        h0, w0 = out.shape[:2]
+        m0 = max(h0, w0)
+        proc = out
+        scale = 1.0
+        if m0 > self._proc_max:
+            scale = self._proc_max / float(m0)
+            proc = cv2.resize(
+                out,
+                (max(1, int(w0 * scale)), max(1, int(h0 * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
 
         # Dynamic tuning: adapt strength to the scene, but keep it stable.
         self._frame_cnt += 1
@@ -137,35 +186,63 @@ class BeautyFilter(BaseFilter):
             self._ensure_profiler()
             if self._profiler is not None:
                 try:
-                    self._profile = self._profiler.profile(frame)
+                    self._profile = self._profiler.profile(proc)
                 except Exception:
                     self._profile = None
+        hi = self._highlight_ratio(proc) if self._auto else 0.0
         if self._auto and self._profile is not None:
             pr = self._profile
-            # Low-light -> lift clarity a bit, but reduce sharpening to avoid noise crunch.
+            # Low-light -> more smoothing, slightly less local-contrast.
             if pr.is_low_light:
-                self.clarity = float(np.clip(0.82, 0.0, 1.0))
-                self.smooth = float(np.clip(0.82, 0.0, 1.0))
-                self.warmth = float(np.clip(0.45, 0.0, 1.0))
-            # Blurry/noisy -> more smoothing, slightly less sharpening.
-            if pr.is_blurry or pr.is_noisy:
-                self.smooth = float(np.clip(self.smooth + 0.08, 0.0, 0.92))
-                self.clarity = float(np.clip(self.clarity - 0.06, 0.55, 0.85))
+                self.smooth = float(np.clip(0.80, 0.0, 1.0))
+                self.clarity = float(np.clip(0.55, 0.0, 1.0))
+                self.warmth = float(np.clip(0.42, 0.0, 1.0))
+            # Noisy/blurry -> avoid crunch: more smoothing, less sharpening/CLAHE.
+            if pr.is_noisy or pr.is_blurry:
+                self.smooth = float(np.clip(max(self.smooth, 0.80), 0.0, 0.92))
+                self.clarity = float(np.clip(min(self.clarity, 0.60), 0.40, 0.75))
+            # Clean frames: allow a bit more "phone-like" pop in midtones.
+            if (not pr.is_low_light) and (not pr.is_noisy) and (not pr.is_blurry) and (not getattr(pr, "is_overexposed", False)):
+                self.clarity = float(np.clip(max(self.clarity, 0.70), 0.0, 0.82))
+
+        # Backlit/highlight scenes: CLAHE + sharpen create halos/noise.
+        # Reduce clarity aggressively when highlights dominate.
+        if hi > 0.03:
+            self.clarity = float(np.clip(min(self.clarity, 0.45), 0.30, 0.60))
+
+        mid = self._midtone_mask(proc) if self._auto else None
+        skin = self._skin_mask(proc) if self._auto else None
+        # Emphasis mask: prefer skin midtones when reliable; otherwise fall back to midtones.
+        em = None
+        if mid is not None and skin is not None:
+            try:
+                cov = float(np.mean(skin > 0.25))
+            except Exception:
+                cov = 0.0
+            if cov < 0.01:
+                # Skin detector failed (common in backlit / WB shifts) -> safe fallback.
+                em = mid
+            else:
+                # Gentle weighting (avoid hard, patchy boundaries).
+                em = np.clip(mid * (0.55 + 0.45 * skin), 0.0, 1.0).astype(np.float32)
+        elif mid is not None:
+            em = mid
 
         # 1) Edge-preserving bilateral smoothing
         if self.smooth > 0:
-            d  = 7 if max(frame.shape[:2]) < 900 else 9
-            sm = cv2.bilateralFilter(out, d=d, sigmaColor=50, sigmaSpace=12)
+            d  = 7 if max(proc.shape[:2]) < 900 else 9
+            sm = cv2.bilateralFilter(proc, d=d, sigmaColor=50, sigmaSpace=12)
             a  = 0.40 + 0.50 * self.smooth
-            out = cv2.addWeighted(sm, a, out, 1.0 - a, 0.0)
+            proc = cv2.addWeighted(sm, a, proc, 1.0 - a, 0.0)
 
         # 2) CLAHE on L — stronger clip for visible contrast pop
         if self.clarity > 0:
-            lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
+            lab = cv2.cvtColor(proc, cv2.COLOR_BGR2LAB)
             L, A, B = cv2.split(lab)
             # Stronger local contrast when clarity is high (presentation-friendly).
             # Recreate CLAHE only when the clip changes materially.
-            clip = 2.2 + 2.2 * float(self.clarity)
+            # Cap CLAHE; never go extreme in live (noise amplification).
+            clip = 1.9 + 1.8 * float(self.clarity)
             try:
                 if abs(getattr(self, "_clahe_clip", 0.0) - clip) > 0.25:
                     self._clahe = cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(8, 8))
@@ -174,38 +251,74 @@ class BeautyFilter(BaseFilter):
                 pass
             L_eq = self._clahe.apply(L)
             a    = 0.5 + 0.5 * self.clarity
-            L    = cv2.addWeighted(L_eq, a, L, 1.0 - a, 0.0)
-            out  = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
+            L2   = cv2.addWeighted(L_eq, a, L, 1.0 - a, 0.0)
+            if em is not None:
+                L = (L.astype(np.float32) * (1.0 - em) + L2.astype(np.float32) * em).astype(np.uint8)
+            else:
+                L = L2
+            proc  = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
 
         # 3) Two-scale unsharp mask
         if self.clarity > 0:
-            img_f  = out.astype(np.float32)
+            img_f  = proc.astype(np.float32)
             b_fine = cv2.GaussianBlur(img_f, (0, 0), 0.8)
             b_mid  = cv2.GaussianBlur(img_f, (0, 0), 2.0)
-            amt    = 0.45 + 0.65 * self.clarity
+            # Reduce sharpen amount to avoid "noisy edge" look.
+            amt    = 0.30 + 0.50 * self.clarity
             sharp  = img_f + amt * (img_f - b_fine) + amt * 0.4 * (img_f - b_mid)
-            out    = np.clip(sharp, 0, 255).astype(np.uint8)
+            sharp_u = np.clip(sharp, 0, 255).astype(np.uint8)
+            if em is not None:
+                proc = (proc.astype(np.float32) * (1.0 - em[..., None]) +
+                        sharp_u.astype(np.float32) * em[..., None]).astype(np.uint8)
+            else:
+                proc = sharp_u
+
+        # Optional: in backlit scenes, pull highlights back slightly
+        # to avoid the "posterized curtain" look.
+        if hi > 0.03:
+            hsv = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
+            H, S, V = cv2.split(hsv)
+            V_f = V.astype(np.float32)
+            # compress top end only
+            V_f = np.where(V_f > 220.0, 220.0 + (V_f - 220.0) * 0.55, V_f)
+            V2 = np.clip(V_f, 0, 255).astype(np.uint8)
+            proc = cv2.cvtColor(cv2.merge((H, S, V2)), cv2.COLOR_HSV2BGR)
 
         # 4) Vibrance — boost desaturated pixels
         if self.clarity > 0.2:
-            hsv   = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
+            hsv   = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
             H, S, V = cv2.split(hsv)
             S_f   = S.astype(np.float32)
             wt    = 1.0 - S_f / 255.0
-            S_new = np.clip(S_f + self.clarity * 70.0 * wt, 0, 255).astype(np.uint8)
-            out   = cv2.cvtColor(cv2.merge([H, S_new, V]), cv2.COLOR_HSV2BGR)
+            # Keep vibrance mild in live (avoid colour noise in shadows).
+            S_new = np.clip(S_f + self.clarity * 55.0 * wt, 0, 255).astype(np.uint8)
+            out_v = cv2.cvtColor(cv2.merge([H, S_new, V]), cv2.COLOR_HSV2BGR)
+            if em is not None:
+                proc = (proc.astype(np.float32) * (1.0 - em[..., None]) +
+                        out_v.astype(np.float32) * em[..., None]).astype(np.uint8)
+            else:
+                proc = out_v
 
         # 5) Warm tone via LUT
         if self.warmth > 0:
-            Bc, G, R = cv2.split(out)
+            Bc, G, R = cv2.split(proc)
             R2 = cv2.LUT(R, self._WARM_LUT_R)
             B2 = cv2.LUT(Bc, self._WARM_LUT_B)
             a  = self.warmth
             R  = cv2.addWeighted(R2, a, R, 1.0 - a, 0.0)
             Bc = cv2.addWeighted(B2, a, Bc, 1.0 - a, 0.0)
-            out = cv2.merge((Bc, G, R))
+            proc = cv2.merge((Bc, G, R))
 
-        return out
+        if scale < 1.0 and proc.shape[:2] != (h0, w0):
+            proc = cv2.resize(proc, (w0, h0), interpolation=cv2.INTER_LINEAR)
+            if em is not None:
+                em = cv2.resize(em, (w0, h0), interpolation=cv2.INTER_LINEAR)
+
+        if em is None:
+            return proc
+        # Final blend: only push enhancements into midtones.
+        return (out.astype(np.float32) * (1.0 - em[..., None]) +
+                proc.astype(np.float32) * em[..., None]).astype(np.uint8)
 
 
 # ── Enhance: GlobalEnhancer — full quality pipeline, real-time ───────
@@ -232,6 +345,11 @@ class EnhanceLiveFilter(BaseFilter):
         self._run_every = 3
         self._cached: Optional[np.ndarray] = None
         self._auto = True
+        self._midtone_only = True
+        # Stabilize preview: don't run the heavy path too frequently even if
+        # the GUI timer ticks faster. This reduces FPS spikes/jitter.
+        self._min_interval_ms: float = 60.0
+        self._last_run_ts: float = 0.0
 
     def reset(self) -> None:
         if self._enhancer is not None:
@@ -240,21 +358,21 @@ class EnhanceLiveFilter(BaseFilter):
         self._profile   = None
 
     def set_params(self, **kwargs) -> None:
-        """Tune the global stack live. Accepts: intensity 0..1."""
+        """Tune the global stack live. Accepts: intensity 0..1.30."""
         if "intensity" in kwargs:
-            v = float(np.clip(kwargs["intensity"], 0.0, 1.0))
+            v = float(np.clip(kwargs["intensity"], 0.0, 1.30))
             self._intensity = v
             if self._enhancer is not None:
                 cfg = self._enhancer.cfg
-                # Slightly stronger "presentation" mapping; capped to avoid drift.
-                cfg.white_balance  = min(0.95, 0.90 * v)
-                cfg.shadow_lift    = min(0.90, 0.85 * v)
-                cfg.denoise        = min(0.70, 0.62 * v)
-                cfg.clahe_strength = min(0.90, 0.85 * v)
-                cfg.hdr_tone       = min(0.80, 0.72 * v)
-                cfg.sharpen        = min(0.88, 0.82 * v)
-                cfg.vibrance       = min(0.80, 0.72 * v)
-                cfg.film_look      = min(0.70, 0.60 * v)
+                # Presentation mapping; capped to avoid drift / banding on webcams.
+                cfg.white_balance  = min(1.00, 0.94 * v)
+                cfg.shadow_lift    = min(0.98, 0.92 * v)
+                cfg.denoise        = min(0.78, 0.67 * v)
+                cfg.clahe_strength = min(0.98, 0.92 * v)
+                cfg.hdr_tone       = min(0.88, 0.80 * v)
+                cfg.sharpen        = min(0.95, 0.90 * v)
+                cfg.vibrance       = min(0.92, 0.84 * v)
+                cfg.film_look      = min(0.82, 0.70 * v)
         if "auto" in kwargs:
             self._auto = bool(kwargs["auto"])
         if "proc_max" in kwargs:
@@ -310,6 +428,12 @@ class EnhanceLiveFilter(BaseFilter):
         if self._run_every > 1 and (self._frame_cnt % self._run_every) != 0:
             return self._cached if self._cached is not None else frame
 
+        # Time-budget guard: keep preview stable by enforcing a minimum interval.
+        now = time.perf_counter()
+        if self._cached is not None and self._min_interval_ms > 0:
+            if self._last_run_ts > 0 and (now - self._last_run_ts) * 1000.0 < self._min_interval_ms:
+                return self._cached
+
         if self._frame_cnt % 20 == 1 and self._profiler is not None:
             try:
                 self._profile = self._profiler.profile(frame)
@@ -319,10 +443,12 @@ class EnhanceLiveFilter(BaseFilter):
             pr = self._profile
             # Scene-adaptive intensity: stronger on clean frames, safer on low-light/noisy/blurry.
             base = float(np.clip(self._intensity, 0.0, 1.0))
-            if pr.is_low_light or pr.is_noisy or pr.is_blurry:
-                v = max(0.55, base * 0.85)
+            if pr.is_overexposed:
+                v = max(0.45, base * 0.70)
+            elif pr.is_low_light or pr.is_noisy or pr.is_blurry:
+                v = max(0.50, base * 0.80)
             else:
-                v = min(1.0, base * 1.05)
+                v = min(1.30, base * 1.12)
             self.set_params(intensity=v)
         try:
             img = frame
@@ -342,7 +468,29 @@ class EnhanceLiveFilter(BaseFilter):
                 out = res.image
                 if out.shape[:2] != (h, w):
                     out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+                if self._midtone_only:
+                    # Apply enhancement mostly on midtones to avoid halos/banding in highlights
+                    # (e.g. curtains / backlit windows).
+                    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    mid = ((g >= 25) & (g <= 230)).astype(np.float32)
+                    mid = cv2.GaussianBlur(mid, (0, 0), 3.0)
+                    # Prefer skin/face areas: reduces "background damage" in backlit scenes.
+                    try:
+                        ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+                        _, cr, cb = cv2.split(ycrcb)
+                        skin = ((cr >= 135) & (cr <= 180) & (cb >= 85) & (cb <= 135)).astype(np.uint8) * 255
+                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, k, iterations=1)
+                        skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, k, iterations=2)
+                        skin = cv2.GaussianBlur(skin, (0, 0), 7.0).astype(np.float32) / 255.0
+                        cov = float(np.mean(skin > 0.25))
+                        em = mid if cov < 0.01 else np.clip(mid * (0.55 + 0.45 * skin), 0.0, 1.0).astype(np.float32)
+                    except Exception:
+                        em = mid
+                    out = (img.astype(np.float32) * (1.0 - em[..., None]) +
+                           out.astype(np.float32) * em[..., None]).astype(np.uint8)
                 self._cached = out
+                self._last_run_ts = now
                 return out
         except Exception:
             pass

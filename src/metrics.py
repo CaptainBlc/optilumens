@@ -20,6 +20,8 @@ class QualityMetrics:
     entropy_after: float
     colorfulness_before: float
     colorfulness_after: float
+    delta_e: float
+    sat_shift: float
 
 
 class MetricsCalculator:
@@ -67,6 +69,28 @@ class MetricsCalculator:
         diff = (diff / mx * 255).astype(np.uint8) if mx > 0 else diff.astype(np.uint8)
         return cv2.applyColorMap(diff, cv2.COLORMAP_TURBO)
 
+    @staticmethod
+    def delta_e(a: np.ndarray, b: np.ndarray) -> float:
+        """Mean LAB ΔE (CIE76) — fast perceptual colour drift proxy."""
+        if a.shape[:2] != b.shape[:2]:
+            b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+        lab_a = cv2.cvtColor(a, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab_b = cv2.cvtColor(b, cv2.COLOR_BGR2LAB).astype(np.float32)
+        d = lab_a - lab_b
+        de = np.sqrt(np.sum(d * d, axis=2))
+        return float(de.mean())
+
+    @staticmethod
+    def sat_shift(a: np.ndarray, b: np.ndarray) -> float:
+        """Mean |ΔS| in HSV (0..255)."""
+        if a.shape[:2] != b.shape[:2]:
+            b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_AREA)
+        ha = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
+        hb = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+        Sa = ha[:, :, 1].astype(np.float32)
+        Sb = hb[:, :, 1].astype(np.float32)
+        return float(np.mean(np.abs(Sb - Sa)))
+
     def compute_all(self, original: np.ndarray, restored: np.ndarray) -> QualityMetrics:
         return QualityMetrics(
             psnr              = self.psnr(original, restored),
@@ -75,4 +99,6 @@ class MetricsCalculator:
             entropy_after     = self.entropy(restored),
             colorfulness_before = self.colorfulness(original),
             colorfulness_after  = self.colorfulness(restored),
+            delta_e           = self.delta_e(original, restored),
+            sat_shift         = self.sat_shift(original, restored),
         )

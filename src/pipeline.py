@@ -93,6 +93,66 @@ def _global_cfg_from_preset(preset) -> GlobalEnhancerConfig:
 def _clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+def _auto_strength(profile: Optional[ProfileResult]) -> float:
+    """Overall enhancement strength in [0..1] from profile signals."""
+    if profile is None:
+        return 0.55
+    b = float(getattr(profile, "brightness", 0.50))
+    c = float(getattr(profile, "contrast", 0.25))
+    blur = float(getattr(profile, "blur_score", 120.0))
+    noise = float(getattr(profile, "noise_level", 6.0))
+    low = bool(getattr(profile, "is_low_light", False))
+    ov = bool(getattr(profile, "is_overexposed", False))
+
+    blur_need = _clamp((130.0 - blur) / 90.0, 0.0, 1.0)          # <40 => high need
+    noise_need = _clamp((noise - 2.5) / 10.0, 0.0, 1.0)
+    contrast_need = _clamp((0.28 - c) / 0.18, 0.0, 1.0)
+    light_need = _clamp((0.52 - b) / 0.22, 0.0, 1.0) if low else 0.0
+
+    s = (
+        0.40 * blur_need +
+        0.25 * contrast_need +
+        0.20 * noise_need +
+        0.15 * light_need
+    )
+    if ov:
+        s = max(0.0, s - 0.35)
+    return _clamp01(s)
+
+
+def _scale_region_cfg(cfg: RegionConfig, k: float) -> RegionConfig:
+    """Scale cosmetic knobs safely. k in [0..1.3]."""
+    kk = _clamp(k, 0.0, 1.30)
+    return RegionConfig(
+        skin_smooth=_clamp01(cfg.skin_smooth * kk),
+        eye_sharpen=_clamp01(cfg.eye_sharpen * kk),
+        eye_brighten=_clamp01(cfg.eye_brighten * kk),
+        lip_vibrance=_clamp01(cfg.lip_vibrance * kk),
+        lip_warmth=_clamp01(cfg.lip_warmth * kk),
+        brow_contrast=_clamp01(cfg.brow_contrast * kk),
+        nose_sharpen=_clamp01(cfg.nose_sharpen * kk),
+    )
+
+
+def _scale_global_cfg(cfg: GlobalEnhancerConfig, k: float) -> GlobalEnhancerConfig:
+    """Scale global knobs safely. k in [0..1.3]."""
+    kk = _clamp(k, 0.0, 1.30)
+    return GlobalEnhancerConfig(
+        white_balance=_clamp01(cfg.white_balance * kk),
+        shadow_lift=_clamp01(cfg.shadow_lift * kk),
+        denoise=_clamp01(cfg.denoise * kk),
+        clahe_strength=_clamp01(cfg.clahe_strength * kk),
+        hdr_tone=_clamp01(cfg.hdr_tone * kk),
+        sharpen=_clamp01(cfg.sharpen * kk),
+        vibrance=_clamp01(cfg.vibrance * kk),
+        film_look=_clamp01(cfg.film_look * kk),
+        temporal_frames=int(getattr(cfg, "temporal_frames", 3) or 3),
+    )
+
 
 def _wow_dynamic_global_cfg(preset, profile: Optional[ProfileResult]) -> GlobalEnhancerConfig:
     """
@@ -109,6 +169,7 @@ def _wow_dynamic_global_cfg(preset, profile: Optional[ProfileResult]) -> GlobalE
     low = bool(getattr(profile, "is_low_light", False))
     blurry = bool(getattr(profile, "is_blurry", False))
     noisy = bool(getattr(profile, "is_noisy", False))
+    c = float(getattr(profile, "contrast", 0.25))
 
     # brightness below ~0.55 => low-light strength factor 0..1
     darkness = max(0.0, 0.55 - b) / 0.25
@@ -120,6 +181,15 @@ def _wow_dynamic_global_cfg(preset, profile: Optional[ProfileResult]) -> GlobalE
     m_sh   = 1.0 - (0.25 if blurry else 0.0) - (0.10 if noisy else 0.0)
     m_vib  = 1.0 - (0.22 if low else 0.0) - (0.08 if noisy else 0.0)
     m_film = 1.0 - (0.35 if low else 0.0)
+
+    # Bright / already-contrasty scenes: reduce local contrast and colour punch
+    # to avoid "plastic" oversaturation and harsh tone mapping.
+    if b >= 0.60:
+        m_vib *= 0.85
+        m_film *= 0.85
+    if c >= 0.28:
+        cfg.clahe_strength = _clamp01(cfg.clahe_strength * 0.80)
+        cfg.hdr_tone = _clamp01(cfg.hdr_tone * 0.85)
 
     cfg.shadow_lift = _clamp01(cfg.shadow_lift * m_lift)
     cfg.denoise     = _clamp01(cfg.denoise * m_dn)
@@ -275,8 +345,6 @@ class ImageEnhancementPipeline:
                                 look per scenario (portrait, old_photo,
                                 magazine, low_light, ...).
         """
-        if preset is not None and fidelity_weight is None:
-            fidelity_weight = float(preset.fidelity)
         result = EnhancementResult(original=image.copy() if image is not None else None)
         log = result.log
         timings = result.timings_ms
@@ -296,8 +364,85 @@ class ImageEnhancementPipeline:
             image.shape[1], image.shape[0],
             image.shape[0] * image.shape[1] / 1e6))
 
+        mp_in = (image.shape[0] * image.shape[1]) / 1e6
+        preset_name = str(getattr(preset, "name", "") or "").lower() if preset is not None else ""
+
+        def _resize_max_side(img: np.ndarray, max_side: int) -> np.ndarray:
+            h, w = img.shape[:2]
+            m = max(h, w)
+            if m <= max_side:
+                return img
+            s = max_side / float(m)
+            return cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+
+        def _highlight_ratio(img: np.ndarray) -> float:
+            """Fraction of very bright pixels (backlit indicator)."""
+            try:
+                small = _resize_max_side(img, 320)
+                g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                return float(np.mean(g >= 245))
+            except Exception:
+                return 0.0
+
+        def _face_mask_from_semantic(sem) -> Optional[np.ndarray]:
+            """Return a soft float32 [0..1] mask for the primary face region."""
+            if sem is None or not getattr(sem, "faces", None):
+                return None
+            try:
+                face0 = sem.faces[0]
+                skin = None
+                try:
+                    skin = face0.regions.get("skin")
+                except Exception:
+                    skin = None
+                if skin is not None and getattr(skin, "mask", None) is not None:
+                    m = skin.mask.astype(np.float32) / 255.0
+                elif getattr(sem, "label_map", None) is not None:
+                    m = (sem.label_map > 0).astype(np.float32)
+                else:
+                    return None
+                if m.shape[:2] != (image.shape[0], image.shape[1]):
+                    m = cv2.resize(m, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+                m = cv2.GaussianBlur(m, (0, 0), 9.0)
+                return np.clip(m, 0.0, 1.0)
+            except Exception:
+                return None
+
+        def _apply_face_micro_polish(img_in: np.ndarray, sem, amount: float) -> Optional[np.ndarray]:
+            """Very mild face-only micro sharpening (safe phone-like crispness)."""
+            m = _face_mask_from_semantic(sem)
+            if m is None:
+                return None
+            try:
+                a = float(np.clip(amount, 0.0, 1.0))
+                if a <= 0.01:
+                    return None
+                img_f = img_in.astype(np.float32)
+                blur = cv2.GaussianBlur(img_f, (0, 0), sigmaX=1.0)
+                sharp = img_f + (0.60 * a) * (img_f - blur)
+                sharp = np.clip(sharp, 0, 255).astype(np.uint8)
+                out = (
+                    img_in.astype(np.float32) * (1.0 - m[..., None]) +
+                    sharp.astype(np.float32) * m[..., None]
+                ).astype(np.uint8)
+                return out
+            except Exception:
+                return None
+
+        # Performance policy for very large images:
+        # - profiling/metrics/global are O(HW). Run them on a proxy to avoid multi-second stalls.
+        # - AI layers still run as decided (they operate on faces/tiles), but we avoid full-res
+        #   classical stacks unless explicitly needed.
+        perf_large = mp_in >= 4.0
+        prof_img = image
+        if perf_large:
+            prof_img = _resize_max_side(image, 1024)
+            log.append("  [PERF] large input {:.1f}MP → proxy {}x{} for analyze/metrics/global".format(
+                mp_in, prof_img.shape[1], prof_img.shape[0]
+            ))
+
         # ── Step 1: analyzeImage() ──
-        profile = _timeit("analyze", lambda: self.analyzeImage(image))
+        profile = _timeit("analyze", lambda: self.analyzeImage(prof_img))
         result.profile = profile
         if profile:
             log.append("--- analyzeImage() ---")
@@ -316,17 +461,62 @@ class ImageEnhancementPipeline:
                 profile.skin_ratio,
                 "(FACE DETECTED)" if profile.has_skin else ""))
 
+        # ── Auto dynamics: continuous strength scaling ──
+        strength = _auto_strength(profile)
+        # Map [0..1] => [0.80..1.20] (clean -> milder, poor -> stronger)
+        k_auto = 0.80 + 0.40 * strength
+        log.append("  [AUTO] strength={:.2f}  scale={:.2f}".format(strength, k_auto))
+        if fidelity_weight is None:
+            # Poor frames -> lower fw (more AI). Clean frames -> higher fw (more original).
+            fidelity_weight = _clamp(0.75 - 0.35 * strength, 0.30, 0.85)
+
         # ── Step 2: DecisionEngine — decide which layers to execute ──
-        # Probe face count cheaply via the profile's skin ratio (engine
-        # treats skin > 4% as a positive face indicator).  We don't run
-        # the heavy face detector twice — the FaceRestorer call below
-        # will do its own detection if GFPGAN is in the plan.
+        # IMPORTANT: skin_ratio can be misleading on webcam/backlit scenes.
+        # Use a fast RetinaFace-only probe to get a reliable faces_found count
+        # for the DecisionEngine without running the full parser or GFPGAN.
         if self._engine is not None:
+            faces_probe = 0
+            try:
+                # Detection on a modest proxy keeps it fast and stable.
+                det_img = _resize_max_side(image, 640)
+                faces_probe = int(getattr(self._parser, "detect_faces_count", lambda _x: 0)(det_img))
+            except Exception:
+                faces_probe = 0
+
+            # ── Preset: automatic selection (default) ──
+            # If the user didn't specify a preset (GUI default), choose one based on
+            # the profile + detected face count. Users can still override via chat.
+            if preset is None and profile is not None:
+                try:
+                    from scene_presets import PRESETS
+                    pn_auto = "natural_plus"
+                    if getattr(profile, "is_low_light", False):
+                        pn_auto = "low_light"
+                    elif getattr(profile, "is_overexposed", False):
+                        pn_auto = "natural"
+                    elif faces_probe >= 2:
+                        pn_auto = "group"
+                    elif faces_probe == 1:
+                        # When quality is poor, use portrait; otherwise stick to the
+                        # safe default phone look.
+                        if getattr(profile, "is_blurry", False) or getattr(profile, "is_noisy", False):
+                            pn_auto = "portrait"
+                        else:
+                            pn_auto = "natural_plus"
+                    preset = PRESETS.get(pn_auto) or preset
+                    if preset is not None:
+                        log.append("  [AUTO] preset selected: '{}'".format(preset.name))
+                except Exception:
+                    pass
+
+            if preset is not None and fidelity_weight is None:
+                fidelity_weight = float(getattr(preset, "fidelity", 0.5))
+
             plan = _timeit(
                 "decide",
                 lambda: self._engine.decide(
                     profile,
-                    faces_found=0,
+                    faces_found=faces_probe,
                     image_shape=image.shape,
                     preset_name=str(getattr(preset, "name", "")) if preset is not None else None,
                 ),
@@ -338,6 +528,41 @@ class ImageEnhancementPipeline:
             plan = None
 
         current = image.copy()  # this is the "rolling" image as layers run
+
+        # ── Plan guardrails (webcam-friendly): avoid double AI detail stacks ──
+        # If GFPGAN already ran for a detected face, running Real-ESRGAN right after
+        # often makes the output look crunchy / artificial on webcam captures.
+        # Keep Real-ESRGAN only when it's truly needed (very blur/noise/low contrast/low light).
+        if plan is not None and profile is not None:
+            try:
+                pn_now = str(getattr(preset, "name", "") or "").lower() if preset is not None else ""
+                gf_on = any(d.layer == Layer.GFPGAN and d.run for d in plan.steps)
+                if gf_on:
+                    # Webcams often score as "blurry" even when the face is usable.
+                    # If a face is present and GFPGAN already ran, prefer NOT stacking
+                    # Real-ESRGAN unless quality is truly poor.
+                    faces_present = bool(faces_probe > 0)
+                    very_blur = float(getattr(profile, "blur_score", 0.0)) < 40.0
+                    low_light = bool(getattr(profile, "is_low_light", False))
+                    noisy = bool(getattr(profile, "is_noisy", False))
+                    low_contrast = float(getattr(profile, "contrast", 1.0)) < 0.16
+                    # Keep Real-ESRGAN only for extreme cases (or when no face exists).
+                    keep = (not faces_present) and (very_blur or low_light or noisy or low_contrast)
+                    keep = keep or (faces_present and (low_light or noisy or low_contrast or very_blur))
+                    if not keep:
+                        for d in plan.steps:
+                            if d.layer == Layer.REAL_ESRGAN and d.run:
+                                d.run = False
+                                log.append("  [AUTO] REAL_ESRGAN suppressed — GFPGAN already ran (avoid over-processing / latency)")
+                                break
+                # When we mutate the plan, refresh the summary line (small UX polish).
+                plan.steps.sort(key=lambda d: d.priority)
+                run_layers = [d.layer.value for d in plan.steps if d.run]
+                plan.summary = ("All layers skipped - image already clean."
+                                if not run_layers
+                                else "Execution plan: " + " -> ".join(run_layers))
+            except Exception:
+                pass
 
         # Preset overrides on the plan: a preset can force a layer on/off.
         # We do this *after* the engine has explained itself, so the log
@@ -366,7 +591,11 @@ class ImageEnhancementPipeline:
                         low_light = bool(getattr(profile, "is_low_light", False))
                         noisy = bool(getattr(profile, "is_noisy", False))
                         low_contrast = float(getattr(profile, "contrast", 1.0)) < 0.18
-                        if not (very_blur or low_light or noisy or low_contrast):
+                        large_frame = mp_in >= 1.0
+                        if large_frame and not (very_blur or low_light or noisy or low_contrast):
+                            d.run = False
+                            log.append("  [WOW] REAL_ESRGAN suppressed (perf) — large frame, rely on Global+Region")
+                        elif not (very_blur or low_light or noisy or low_contrast):
                             d.run = False
                             log.append("  [WOW] REAL_ESRGAN suppressed (perf) — frame is clean enough")
 
@@ -429,6 +658,16 @@ class ImageEnhancementPipeline:
                         guard = QualityGuard(accept_threshold=72.0, warn_threshold=55.0, blend_ratio=0.50)
                     elif label == "RealESRGAN":
                         guard = QualityGuard(accept_threshold=72.0, warn_threshold=55.0, blend_ratio=0.45)
+                elif pn == "wow":
+                    # WOW should be strong but safe: prefer blending back when drift grows.
+                    if label == "GlobalEnhance":
+                        guard = QualityGuard(accept_threshold=72.0, warn_threshold=60.0, blend_ratio=0.75)
+                    elif label == "RegionEnhance":
+                        guard = QualityGuard(accept_threshold=72.0, warn_threshold=60.0, blend_ratio=0.70)
+                    elif label == "GFPGAN":
+                        guard = QualityGuard(accept_threshold=70.0, warn_threshold=58.0, blend_ratio=0.60)
+                    elif label == "RealESRGAN":
+                        guard = QualityGuard(accept_threshold=70.0, warn_threshold=58.0, blend_ratio=0.55)
 
             rep = guard.evaluate(before, after, label=label)
             result.guard_reports.append(rep)
@@ -470,7 +709,9 @@ class ImageEnhancementPipeline:
             # Performance: face parsing (RetinaFace + BiSeNet) can be very slow on CPU.
             # For "wow" we accept doing cosmetics on a smaller proxy image and upscaling
             # the final cosmetic result back; Guard still protects the output.
-            fast_cosmetic = pn_preset == "wow"
+            # IMPORTANT (quality): on ~720p webcam captures, a 320px proxy causes visible
+            # pixelation on faces. Only enable proxy cosmetics on truly large frames.
+            fast_cosmetic = (pn_preset == "wow") and (mp_in >= 2.0)
             base_img = current
             if fast_cosmetic:
                 try:
@@ -500,10 +741,24 @@ class ImageEnhancementPipeline:
                     pn_cfg = str(getattr(preset, "name", "") or "").lower()
                     if pn_cfg == "wow":
                         reg_cfg = _wow_dynamic_region_cfg(preset, profile)
+                        reg_cfg = _scale_region_cfg(reg_cfg, k_auto)
                         reg_enh = RegionEnhancer(reg_cfg)
                         log.append("  [WOW] dynamic region cfg applied")
                     else:
-                        reg_enh = RegionEnhancer(_region_cfg_from_preset(preset))
+                        reg_cfg = _scale_region_cfg(_region_cfg_from_preset(preset), k_auto)
+                        # Backlit portraits: reduce "plastic" risk by dialing cosmetics down a bit.
+                        try:
+                            hi_reg = _highlight_ratio(current)
+                            if hi_reg > 0.10 and pn_cfg in ("portrait", "natural_plus"):
+                                reg_cfg = _scale_region_cfg(reg_cfg, 0.85)
+                                # Extra targeted clamps for the most "filter-looking" knobs.
+                                reg_cfg.skin_smooth = _clamp01(reg_cfg.skin_smooth * 0.90)
+                                reg_cfg.eye_sharpen = _clamp01(reg_cfg.eye_sharpen * 0.85)
+                                reg_cfg.lip_vibrance = _clamp01(reg_cfg.lip_vibrance * 0.85)
+                                log.append("  [AUTO] backlit cosmetic clamp applied (hi={:.3f})".format(hi_reg))
+                        except Exception:
+                            pass
+                        reg_enh = RegionEnhancer(reg_cfg)
                     log.append("  [PRESET] region knobs from '{}' "
                                "(skin={:.2f} eyes={:.2f} lips={:.2f})".format(
                                    preset.name, preset.skin_amount,
@@ -526,6 +781,20 @@ class ImageEnhancementPipeline:
                     current = _apply_guard(
                         current, out_img, "RegionEnhance", "region_result")
 
+            # ── Step 5b: Face-only micro polish (clean frames) ──
+            # Even when the image is "clean", we want a subtle, phone-like crispness
+            # on the face without affecting the background.
+            try:
+                pn_pol = str(getattr(preset, "name", "") or "").lower() if preset is not None else ""
+                gf_ran = bool(result.restoration is not None and getattr(result.restoration, "faces_found", 0) > 0)
+                if (pn_pol in ("natural_plus", "portrait")) and (not gf_ran) and (strength <= 0.15):
+                    outp = _timeit("face_polish", lambda: _apply_face_micro_polish(current, result.semantic, amount=(0.22 - 0.10 * strength)))
+                    if outp is not None:
+                        log.append("  [AUTO] face micro-polish applied")
+                        current = _apply_guard(current, outp, "FacePolish", None)
+            except Exception:
+                pass
+
         # ── Step 6: Global Enhancement (Furkan) ──
         if _layer_should_run(Layer.GLOBAL_ENHANCE):
             log.append("--- GlobalEnhancer ---")
@@ -537,30 +806,133 @@ class ImageEnhancementPipeline:
                 if pn in ("natural_plus", "group") and (
                     getattr(profile, "is_low_light", False) or getattr(profile, "is_blurry", False)
                 ):
-                    glob_enh = GlobalEnhancer(_low_light_natural_global_cfg(profile))
+                    glob_enh = GlobalEnhancer(_scale_global_cfg(_low_light_natural_global_cfg(profile), k_auto))
                     tag = "low-light" if getattr(profile, "is_low_light", False) else "blurry"
                     log.append("  [PRESET] mild global ({}) for '{}'".format(tag, pn))
                 elif preset is not None and _preset_has_global_overrides(preset):
                     pn2 = str(getattr(preset, "name", "") or "").lower()
                     if pn2 == "wow":
-                        glob_enh = GlobalEnhancer(_wow_dynamic_global_cfg(preset, profile))
+                        glob_enh = GlobalEnhancer(_scale_global_cfg(_wow_dynamic_global_cfg(preset, profile), k_auto))
                         log.append("  [WOW] dynamic global cfg applied")
                     else:
-                        glob_enh = GlobalEnhancer(_global_cfg_from_preset(preset))
+                        glob_enh = GlobalEnhancer(_scale_global_cfg(_global_cfg_from_preset(preset), k_auto))
                         log.append("  [PRESET] global overrides from '{}'".format(
                             preset.name))
                 else:
-                    glob_enh = self._global_enhancer
+                    # Do not mutate shared cfg; use a scaled copy for this run.
+                    glob_enh = GlobalEnhancer(_scale_global_cfg(self._global_enhancer.cfg, k_auto))
+
+                skip_global = False
+                face_only_polish = False
+                # Backlit/highlight scenes: clamp local contrast / tone mapping to avoid
+                # curtain/window banding and colour shifts.
+                try:
+                    hi = _highlight_ratio(current)
+                    pn_live = str(getattr(preset, "name", "") or "").lower() if preset is not None else ""
+                    faces_present = bool(getattr(result, "semantic", None) is not None and getattr(result.semantic, "faces", None))
+                    # Portrait-style presets must never wreck the background. Default to
+                    # face-only global polish even when not backlit.
+                    if (pn_live in ("portrait", "natural_plus")) and faces_present and (profile is not None) and (not getattr(profile, "is_low_light", False)):
+                        face_only_polish = True
+                        log.append("  [AUTO] portrait-safe global: face-only polish")
+                    # Hard skip for very backlit scenes unless we're actually in low-light.
+                    # This prevents the "broken / posterized curtain" look.
+                    if hi > 0.10 and profile is not None and (not getattr(profile, "is_low_light", False)):
+                        log.append("  [AUTO] backlit scene (hi={:.3f}) — GLOBAL_ENHANCE skipped".format(hi))
+                        skip_global = True
+                        # If we have a face mask (semantic ran), we can still apply a
+                        # very mild polish only on the face area without damaging
+                        # the curtains/windows.
+                        if result.semantic is not None and getattr(result.semantic, "faces", None):
+                            face_only_polish = True
+                    if (not skip_global) and hi > 0.03:
+                        cfg = glob_enh.cfg
+                        cfg.clahe_strength = float(np.clip(cfg.clahe_strength * 0.60, 0.0, 1.0))
+                        cfg.hdr_tone       = float(np.clip(cfg.hdr_tone * 0.65, 0.0, 1.0))
+                        cfg.sharpen        = float(np.clip(cfg.sharpen * 0.75, 0.0, 1.0))
+                        cfg.vibrance       = float(np.clip(cfg.vibrance * 0.60, 0.0, 1.0))
+                        cfg.shadow_lift    = float(np.clip(cfg.shadow_lift * 0.85, 0.0, 1.0))
+                        cfg.white_balance  = float(np.clip(cfg.white_balance * 0.85, 0.0, 1.0))
+                        cfg.film_look      = float(np.clip(cfg.film_look * 0.85, 0.0, 1.0))
+                        log.append("  [AUTO] backlit clamp applied (hi={:.3f})".format(hi))
+                except Exception:
+                    pass
+
+                if skip_global:
+                    if not face_only_polish:
+                        # Keep the pipeline output as-is; guard would be redundant.
+                        log.append("  GlobalEnhancer: passthrough (skipped)")
+                        raise StopIteration()
+                    log.append("  [AUTO] face-only polish in backlit scene")
+
+                # On huge images, run the global stack on a proxy and upscale back.
+                base_global = current
+                if perf_large:
+                    base_global = _resize_max_side(current, 1280)
+                    log.append("  [PERF] global proxy: {}x{} -> {}x{}".format(
+                        current.shape[1], current.shape[0], base_global.shape[1], base_global.shape[0]
+                    ))
+
                 ge = _timeit(
                     "global",
-                    lambda: glob_enh.enhance(current, profile=profile, use_temporal=False),
+                    lambda: glob_enh.enhance(base_global, profile=profile, use_temporal=False),
                 )
                 if ge.success and ge.image is not None:
                     log.extend("  " + ln for ln in ge.log)
-                    current = _apply_guard(
-                        current, ge.image, "GlobalEnhance", None)
+                    out_img = ge.image
+                    if perf_large and out_img.shape[:2] != current.shape[:2]:
+                        try:
+                            out_img = cv2.resize(out_img, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        except Exception:
+                            out_img = ge.image
+                    if face_only_polish and result.semantic is not None:
+                        # Blend only into the face region (soft feather) to avoid background artifacts.
+                        try:
+                            # Extra safety: in strong backlit, keep the face-only polish very mild
+                            # (avoid "makeup filter" feel).
+                            try:
+                                hi_face = _highlight_ratio(current)
+                                if hi_face > 0.10:
+                                    cfg = glob_enh.cfg
+                                    cfg.clahe_strength = _clamp01(cfg.clahe_strength * 0.65)
+                                    cfg.hdr_tone       = _clamp01(cfg.hdr_tone * 0.70)
+                                    cfg.sharpen        = _clamp01(cfg.sharpen * 0.75)
+                                    cfg.vibrance       = _clamp01(cfg.vibrance * 0.70)
+                                    cfg.film_look      = _clamp01(cfg.film_look * 0.55)
+                                    log.append("  [AUTO] backlit face-polish soften (hi={:.3f})".format(hi_face))
+                            except Exception:
+                                pass
+                            mask = None
+                            face0 = result.semantic.faces[0]
+                            skin = None
+                            try:
+                                skin = face0.regions.get("skin")
+                            except Exception:
+                                skin = None
+                            if skin is not None and getattr(skin, "mask", None) is not None:
+                                mask = (skin.mask.astype(np.float32) / 255.0)
+                            elif getattr(result.semantic, "label_map", None) is not None:
+                                mask = (result.semantic.label_map > 0).astype(np.float32)
+                            if mask is not None:
+                                if mask.shape[:2] != current.shape[:2]:
+                                    mask = cv2.resize(mask, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_LINEAR)
+                                mask = cv2.GaussianBlur(mask, (0, 0), 9.0)
+                                mask = np.clip(mask, 0.0, 1.0)
+                                blended = (
+                                    current.astype(np.float32) * (1.0 - mask[..., None]) +
+                                    out_img.astype(np.float32) * mask[..., None]
+                                ).astype(np.uint8)
+                                current = _apply_guard(current, blended, "GlobalEnhance(face)", None)
+                            else:
+                                current = _apply_guard(current, out_img, "GlobalEnhance", None)
+                        except Exception:
+                            current = _apply_guard(current, out_img, "GlobalEnhance", None)
+                    else:
+                        current = _apply_guard(current, out_img, "GlobalEnhance", None)
                 else:
                     log.append("  GlobalEnhancer returned no result -- passthrough")
+            except StopIteration:
+                pass
             except Exception as _e:
                 log.append("  [WARN] GlobalEnhancer failed: {}".format(_e))
 
@@ -569,7 +941,16 @@ class ImageEnhancementPipeline:
         # Step 6: Quality Metrics
         log.append("--- Quality Metrics ---")
         try:
-            m = _timeit("metrics", lambda: self._metrics.compute_all(image, result.restored))
+            # Metrics are for diagnostics; compute on proxy for huge images.
+            if perf_large:
+                img_a = _resize_max_side(image, 1024)
+                img_b = _resize_max_side(result.restored, 1024)
+                log.append("  [PERF] metrics proxy: {}x{} -> {}x{}".format(
+                    image.shape[1], image.shape[0], img_a.shape[1], img_a.shape[0]
+                ))
+                m = _timeit("metrics", lambda: self._metrics.compute_all(img_a, img_b))
+            else:
+                m = _timeit("metrics", lambda: self._metrics.compute_all(image, result.restored))
             result.metrics = m
             log.append("  PSNR         = {:.2f} dB".format(m.psnr))
             log.append("  SSIM         = {:.4f}".format(m.ssim))
@@ -579,15 +960,21 @@ class ImageEnhancementPipeline:
             log.append("  Colorfulness = {:.2f} → {:.2f} (Δ{:+.2f})".format(
                 m.colorfulness_before, m.colorfulness_after,
                 m.colorfulness_after - m.colorfulness_before))
+            log.append("  ΔE (LAB)     = {:.2f}".format(getattr(m, "delta_e", 0.0)))
+            log.append("  ΔS (HSV)     = {:.1f}".format(getattr(m, "sat_shift", 0.0)))
         except Exception as e:
             log.append("[WARN] Metrics failed: {}".format(e))
 
         # Step 7: Difference map
         try:
-            result.diff_map = _timeit(
-                "diff_map", lambda: self._metrics.difference_map(image, result.restored)
-            )
-            log.append("  Difference map: generated")
+            if perf_large:
+                # Skip diff map on huge images to keep latency down (optional UI feature).
+                log.append("  [PERF] diff map skipped for huge image")
+            else:
+                result.diff_map = _timeit(
+                    "diff_map", lambda: self._metrics.difference_map(image, result.restored)
+                )
+                log.append("  Difference map: generated")
         except Exception as e:
             log.append("[WARN] Diff map failed: {}".format(e))
 
