@@ -350,6 +350,13 @@ class EnhanceLiveFilter(BaseFilter):
         # the GUI timer ticks faster. This reduces FPS spikes/jitter.
         self._min_interval_ms: float = 60.0
         self._last_run_ts: float = 0.0
+        # rembg-based person segmentation. When available, ENHANCE only
+        # touches the subject so bright windows / lamps in the background
+        # stay untouched. Falls back to the previous skin/midtone-only
+        # behaviour if rembg or its model can't be loaded.
+        self._person_segmenter = None
+        self._person_mask_cache: Optional[np.ndarray] = None
+        self._person_segment_enabled: bool = True
 
     def reset(self) -> None:
         if self._enhancer is not None:
@@ -450,6 +457,20 @@ class EnhanceLiveFilter(BaseFilter):
             else:
                 v = min(1.30, base * 1.12)
             self.set_params(intensity=v)
+
+        # Refresh the person matte once per heavy run. ~5-10 ms on CUDA
+        # at 320 px, so it sits comfortably inside the existing per-tick
+        # budget; cached/skipped frames above never reach this point.
+        if self._person_segment_enabled:
+            if self._person_segmenter is None:
+                try:
+                    from person_segmenter import PersonSegmenter
+                    self._person_segmenter = PersonSegmenter(
+                        model_name="u2net_human_seg", proc_max=320)
+                except Exception:
+                    self._person_segment_enabled = False
+            if self._person_segmenter is not None:
+                self._person_mask_cache = self._person_segmenter.get_mask(frame)
         try:
             img = frame
             h, w = img.shape[:2]
@@ -487,6 +508,13 @@ class EnhanceLiveFilter(BaseFilter):
                         em = mid if cov < 0.01 else np.clip(mid * (0.55 + 0.45 * skin), 0.0, 1.0).astype(np.float32)
                     except Exception:
                         em = mid
+                    # Person-only restriction: when rembg gave us a matte,
+                    # multiply it in so background pixels (alpha~0) get
+                    # the original frame untouched. No matte → fall back
+                    # to the unrestricted midtone+skin mask above.
+                    pm = self._person_mask_cache
+                    if pm is not None and pm.shape[:2] == em.shape[:2]:
+                        em = (em * pm).astype(np.float32)
                     out = (img.astype(np.float32) * (1.0 - em[..., None]) +
                            out.astype(np.float32) * em[..., None]).astype(np.uint8)
                 self._cached = out
