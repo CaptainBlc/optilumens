@@ -183,8 +183,16 @@ class EnhanceLiveFilter(BaseFilter):
             self._init_w2x()
 
         self._count += 1
-        base = self._beauty.apply(frame)   # smooth display between AI frames
 
+        # ── Classical baseline (every frame, fast) ────────────────────
+        # medianBlur ksize=3 removes grain better than bilateral,
+        # no blurring, ~3ms at 720p
+        base = cv2.medianBlur(frame, 3)
+        base = cv2.convertScaleAbs(base, alpha=1.40, beta=25)
+        blur = cv2.GaussianBlur(base, (0, 0), 1.2)
+        base = cv2.addWeighted(base, 1.30, blur, -0.30, 0)
+
+        # ── Waifu2x AI pass (every SKIP frames if available) ──────────
         if self._w2x_ok and self._count % self.SKIP == 1:
             try:
                 from PIL import Image
