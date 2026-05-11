@@ -135,77 +135,104 @@ class BeautyFilter(BaseFilter):
 
 class EnhanceLiveFilter(BaseFilter):
     """
-    Waifu2x-ncnn-py based live enhancement with BeautyFilter fallback.
+    Hybrid live enhancement: classical every frame + GFPGAN face every 25 frames.
 
-    Every SKIP frames: runs waifu2x (noise=2, scale=1) — AI denoising
-    that removes webcam grain while preserving/recovering fine detail.
-    Between AI frames: shows BeautyFilter result for smooth display.
+    Every frame  : medianBlur + brightness + sharpen  (~8 ms, smooth display)
+    Every 25 fr  : GFPGAN restores the face crop and pastes it back in (~3-5 s)
 
-    Requires:  py -m pip install waifu2x-ncnn-py pillow
-    Vulkan GPU (Intel Iris Plus supported) gives ~5-10 FPS per AI call.
-    Falls back to BeautyFilter if waifu2x is not available.
+    Result: face region shows AI quality, background is classically enhanced.
+    The face cache stays visible between AI updates for smooth display.
     """
 
-    name = "ENHANCE"
-    SKIP = 6
+    name    = "ENHANCE"
+    AI_SKIP = 25
 
     def __init__(self) -> None:
-        self._w2x       = None
-        self._beauty    = BeautyFilter()
-        self._count     = 0
-        self._cached    = None
-        self._init_done = False
-        self._w2x_ok    = False
+        self._restorer   = None
+        self._cascade    = None
+        self._count      = 0
+        self._face_patch = None   # (x1, y1, x2, y2, enhanced_roi)
+        self._init_done  = False
 
     def reset(self) -> None:
-        self._count  = 0
-        self._cached = None
+        self._count      = 0
+        self._face_patch = None
 
-    def _init_w2x(self) -> None:
+    # ── init (lazy, first frame) ──────────────────────────────────────
+
+    def _init(self) -> None:
         self._init_done = True
+        # Haar cascade for fast face detection (~3 ms)
         try:
-            from waifu2x_ncnn_py import Waifu2x
-            try:
-                self._w2x = Waifu2x(gpuid=0, noise=2, scale=1)
-                print("[WAIFU2X] GPU (Vulkan) hazir")
-            except Exception:
-                self._w2x = Waifu2x(gpuid=-1, noise=2, scale=1)
-                print("[WAIFU2X] CPU modu hazir")
-            self._w2x_ok = True
+            path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            c = cv2.CascadeClassifier(path)
+            self._cascade = c if not c.empty() else None
+        except Exception:
+            pass
+        # GFPGAN restorer (lazy — loads model only once)
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from face_restorer import FaceRestorer
+            self._restorer = FaceRestorer(fidelity_weight=0.20)
+            print("[ENHANCE] GFPGAN face restorer ready")
         except Exception as e:
-            print(f"[WAIFU2X] Yuklu degil: {e}")
-            print("[WAIFU2X] Kurmak icin:  py -m pip install waifu2x-ncnn-py pillow")
+            print(f"[ENHANCE] GFPGAN unavailable: {e}")
+
+    # ── fast classical pass (every frame) ────────────────────────────
+
+    @staticmethod
+    def _classical(frame: np.ndarray) -> np.ndarray:
+        out  = cv2.medianBlur(frame, 3)
+        out  = cv2.convertScaleAbs(out, alpha=1.42, beta=28)
+        blur = cv2.GaussianBlur(out, (0, 0), 1.2)
+        return cv2.addWeighted(out, 1.28, blur, -0.28, 0)
+
+    # ── main ─────────────────────────────────────────────────────────
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
         if frame is None or frame.size == 0:
             return frame
         if not self._init_done:
-            self._init_w2x()
+            self._init()
 
         self._count += 1
+        base = self._classical(frame)
 
-        # ── Classical baseline (every frame, fast) ────────────────────
-        # medianBlur ksize=3 removes grain better than bilateral,
-        # no blurring, ~3ms at 720p
-        base = cv2.medianBlur(frame, 3)
-        base = cv2.convertScaleAbs(base, alpha=1.40, beta=25)
-        blur = cv2.GaussianBlur(base, (0, 0), 1.2)
-        base = cv2.addWeighted(base, 1.30, blur, -0.30, 0)
-
-        # ── Waifu2x AI pass (every SKIP frames if available) ──────────
-        if self._w2x_ok and self._count % self.SKIP == 1:
+        # Every AI_SKIP frames: GFPGAN on the face region
+        if (self._restorer is not None
+                and self._cascade is not None
+                and self._count % self.AI_SKIP == 1):
             try:
-                from PIL import Image
-                pil_in  = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                pil_out = self._w2x.process_pil(pil_in)
-                ai      = cv2.cvtColor(np.array(pil_out), cv2.COLOR_RGB2BGR)
-                ai      = cv2.convertScaleAbs(ai, alpha=1.35, beta=20)
-                self._cached = ai
+                h, w = frame.shape[:2]
+                gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self._cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=4,
+                    minSize=(80, 80), flags=cv2.CASCADE_SCALE_IMAGE)
+                if len(faces) > 0:
+                    # Largest face
+                    fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+                    pad = int(max(fw, fh) * 0.40)
+                    x1, y1 = max(0, fx - pad), max(0, fy - pad)
+                    x2, y2 = min(w, fx + fw + pad), min(h, fy + fh + pad)
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.shape[0] > 80 and crop.shape[1] > 80:
+                        res = self._restorer.restore(
+                            crop, fidelity_weight=0.20, only_center_face=True)
+                        if res.success and res.restored is not None:
+                            patch = cv2.resize(res.restored, (x2 - x1, y2 - y1))
+                            self._face_patch = (x1, y1, x2, y2, patch)
             except Exception as e:
-                print(f"[WAIFU2X] frame error: {e}")
+                print(f"[ENHANCE] AI error: {e}")
 
-        if self._cached is not None and self._cached.shape == frame.shape:
-            return cv2.addWeighted(self._cached, 0.75, base, 0.25, 0)
+        # Paste cached AI face over classical base
+        if self._face_patch is not None:
+            x1, y1, x2, y2, patch = self._face_patch
+            fh, fw = patch.shape[:2]
+            if fh == y2 - y1 and fw == x2 - x1:
+                roi = base[y1:y2, x1:x2]
+                base[y1:y2, x1:x2] = cv2.addWeighted(patch, 0.80, roi, 0.20, 0)
+
         return base
 
 
