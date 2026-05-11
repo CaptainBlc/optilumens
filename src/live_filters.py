@@ -150,8 +150,9 @@ class EnhanceLiveFilter(BaseFilter):
     def __init__(self) -> None:
         self._restorer   = None
         self._cascade    = None
+        self._ov         = None   # OpenVINO Intel GPU enhancer
         self._count      = 0
-        self._face_patch = None   # (x1, y1, x2, y2, enhanced_roi)
+        self._face_patch = None
         self._init_done  = False
 
     def reset(self) -> None:
@@ -169,10 +170,21 @@ class EnhanceLiveFilter(BaseFilter):
             self._cascade = c if not c.empty() else None
         except Exception:
             pass
-        # GFPGAN restorer (lazy — loads model only once)
+        # OpenVINO Intel GPU super-resolution (primary AI path)
         try:
             import sys, os
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from openvino_enhancer import get_enhancer
+            self._ov = get_enhancer(device="AUTO")
+            if self._ov.ready:
+                print("[ENHANCE] OpenVINO Intel GPU SR aktif")
+            else:
+                self._ov = None
+        except Exception as e:
+            self._ov = None
+            print(f"[ENHANCE] OpenVINO yok: {e}")
+        # GFPGAN restorer (face restoration fallback)
+        try:
             from face_restorer import FaceRestorer
             self._restorer = FaceRestorer(fidelity_weight=0.20)
             print("[ENHANCE] GFPGAN face restorer ready")
@@ -197,7 +209,17 @@ class EnhanceLiveFilter(BaseFilter):
             self._init()
 
         self._count += 1
-        base = self._classical(frame)
+
+        # OpenVINO Intel GPU path (every frame when model is ready)
+        if self._ov is not None and self._ov.ready:
+            try:
+                base = self._ov.enhance(frame)
+                # Apply classical brightness on top of SR result
+                base = cv2.convertScaleAbs(base, alpha=1.20, beta=15)
+            except Exception:
+                base = self._classical(frame)
+        else:
+            base = self._classical(frame)
 
         # Every AI_SKIP frames: GFPGAN on the face region
         if (self._restorer is not None
