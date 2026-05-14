@@ -52,6 +52,9 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 - **`src/quality_guard.py`** — If mean SSIM < **0.80**, cap trust below accept so GAN outputs are **blended/rejected** instead of accepted on small mean drift.
 - **`src/gui/main_window.py`** — `SwipeWidget`: draw left/right halves via **source rectangles** (no full-frame enhanced + clip) to avoid a bright vertical seam at the slider on high-dynamic splits.
 
+### 2026-05-14 — Difference map for all resolutions (`feat/natural-plus-guardrails`)
+- **`src/pipeline.py`** — Removed the `perf_large` skip for Step 7. **Under 4 MP:** unchanged full-res `MetricsCalculator.difference_map` (TURBO). **4 MP and above:** build heatmap on the same **1024 max-side** proxy as metrics, then **`cv2.resize`** heatmap to full frame so the **Diff** tab always has data without multi-second full-res absdiff on 20 MP+ frames.
+
 ### 2026-05-08 — Live quality pass (feat branch): stronger but highlight-safe
 - **Live filters strengthened (still safe):** `src/live_filters.py`
   - **BEAUTY** default effect increased on midtones (contrast/sharpness/vibrance), while preserving **midtone-only blending** + **backlit highlight suppression** to prevent halos/posterization on curtains/windows.

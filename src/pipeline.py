@@ -965,11 +965,19 @@ class ImageEnhancementPipeline:
         except Exception as e:
             log.append("[WARN] Metrics failed: {}".format(e))
 
-        # Step 7: Difference map
+        # Step 7: Difference map (always — large inputs use a proxy then upscale heat)
         try:
             if perf_large:
-                # Skip diff map on huge images to keep latency down (optional UI feature).
-                log.append("  [PERF] diff map skipped for huge image")
+                da = _resize_max_side(image, 1024)
+                db = _resize_max_side(result.restored, 1024)
+                dm_small = _timeit(
+                    "diff_map", lambda: self._metrics.difference_map(da, db))
+                h0, w0 = image.shape[:2]
+                result.diff_map = cv2.resize(
+                    dm_small, (w0, h0), interpolation=cv2.INTER_LINEAR)
+                log.append(
+                    "  Difference map: proxy {}x{} → full {}x{} (heatmap)".format(
+                        dm_small.shape[1], dm_small.shape[0], w0, h0))
             else:
                 result.diff_map = _timeit(
                     "diff_map", lambda: self._metrics.difference_map(image, result.restored)
