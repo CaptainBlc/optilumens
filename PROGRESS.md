@@ -47,6 +47,11 @@ Derived from Analysis Report §3.5.1 use-case scenarios.
 
 ## Changelog
 
+### 2026-05-14 — Restore quality: portrait-safe Real-ESRGAN, SSIM guard floor, compare compositing (`feat/natural-plus-guardrails`)
+- **`src/decision_engine.py`** — Skip Real-ESRGAN when only global contrast is low on a **sharp, clean, face-present** frame (graded portraits); prevents GAN warp before `FACE_PARSE` / `REGION_ENHANCE`.
+- **`src/quality_guard.py`** — If mean SSIM < **0.80**, cap trust below accept so GAN outputs are **blended/rejected** instead of accepted on small mean drift.
+- **`src/gui/main_window.py`** — `SwipeWidget`: draw left/right halves via **source rectangles** (no full-frame enhanced + clip) to avoid a bright vertical seam at the slider on high-dynamic splits.
+
 ### 2026-05-08 — Live quality pass (feat branch): stronger but highlight-safe
 - **Live filters strengthened (still safe):** `src/live_filters.py`
   - **BEAUTY** default effect increased on midtones (contrast/sharpness/vibrance), while preserving **midtone-only blending** + **backlit highlight suppression** to prevent halos/posterization on curtains/windows.

@@ -225,6 +225,11 @@ class QualityGuard:
             0.10 * sat_pen
         )
 
+        # Structural floor: GANs can keep mean brightness (low drift) while
+        # destroying local structure. Do not accept purely on drift/ΔE.
+        if ssim01 < 0.80:
+            score = min(score, self.accept - 1e-3)
+
         # Hard cap: catastrophic colour drift is always at least a BLEND.
         # A single channel shifting 18% on average is the kind of damage
         # we never want to silently accept, even if SSIM is forgiving.

@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QRect, QPoint, QThread, QTimer, pyqtSignal, QEvent
 from PyQt6.QtGui import (
     QPixmap, QImage, QAction, QKeySequence,
-    QPainter, QPen, QColor, QFont, QBrush, QRegion,
+    QPainter, QPen, QColor, QFont, QBrush,
 )
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -163,13 +163,13 @@ class SwipeWidget(QWidget):
         iw, ih = sb.width(), sb.height()
         xo, yo = (W - iw) // 2, (H - ih) // 2
         self._ir = QRect(xo, yo, iw, ih)
-        sx = int(iw * self._ratio)
+        sx = max(1, min(iw - 1, int(round(iw * self._ratio))))
         lx = xo + sx
 
-        p.drawPixmap(xo, yo, sa)
-        p.setClipRegion(QRegion(QRect(xo, yo, sx, ih)))
-        p.drawPixmap(xo, yo, sb)
-        p.setClipping(False)
+        # Tile-based composite: one source pixel per screen column (avoids
+        # edge halos from full-frame draw + clip on mismatched tone).
+        p.drawPixmap(QRect(xo + sx, yo, iw - sx, ih), sa, QRect(sx, 0, iw - sx, ih))
+        p.drawPixmap(QRect(xo, yo, sx, ih), sb, QRect(0, 0, sx, ih))
 
         p.setPen(QPen(QColor("#c53030"), 2))
         p.drawLine(lx, yo, lx, yo + ih)

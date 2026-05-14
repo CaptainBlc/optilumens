@@ -197,10 +197,26 @@ class DecisionEngine:
                 "AI cleanup useful (blurry={}, noisy={}, low_res={})".format(
                     profile.is_blurry, is_noisy, low_res))
         elif profile.contrast < 0.18:
-            run_general = True
-            general_reason = (
-                "low contrast ({:.2f}) -- Real-ESRGAN micro-detail recovery "
-                "helps".format(profile.contrast))
+            # Warm/graded portraits often read as "low contrast" without being
+            # degraded. Real-ESRGAN can remap facial texture (SSIM collapse)
+            # before FACE_PARSE, breaking RegionEnhancer alignment.
+            sharp_clean_face_portrait = (
+                has_face
+                and (not is_blurry)
+                and (not is_noisy)
+                and (not profile.is_low_light)
+            )
+            if sharp_clean_face_portrait:
+                run_general = False
+                general_reason = (
+                    "low contrast ({:.2f}) on sharp clean face portrait — skip "
+                    "Real-ESRGAN (avoid facial hallucinations); "
+                    "GlobalEnhancer handles tone".format(profile.contrast))
+            else:
+                run_general = True
+                general_reason = (
+                    "low contrast ({:.2f}) -- Real-ESRGAN micro-detail recovery "
+                    "helps".format(profile.contrast))
         else:
             general_reason = (
                 "image already crisp + clean (blur={:.0f}, noise={:.1f}, "
